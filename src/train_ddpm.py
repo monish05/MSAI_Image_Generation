@@ -271,13 +271,20 @@ def main() -> None:
         batch = next(iter(val_loader))
         n = min(4, batch["sketch"].shape[0])
         sk = batch["sketch"].to(device)[:n]
+        photo = batch["photo"].to(device)[:n]
         x_gen = diffusion.sample(unwrap_m, sk)
         unwrap_m.train()
         out_dir.mkdir(parents=True, exist_ok=True)
-        vis = (x_gen.clamp(-1, 1) + 1) / 2
-        save_image(vis, out_dir / fname, nrow=2)
+        vis_gen = (x_gen.clamp(-1, 1) + 1) / 2
+        vis_photo = (photo.clamp(-1, 1) + 1) / 2
+        vis_sketch = ((sk.clamp(-1, 1) + 1) / 2).repeat(1, 3, 1, 1)
+
+        # For each sample: [sketch | generated | ground-truth photo].
+        triplets = torch.stack([vis_sketch, vis_gen, vis_photo], dim=1).flatten(0, 1)
+        save_image(triplets, out_dir / fname, nrow=3)
         if writer is not None:
-            writer.add_image("val/samples", make_grid(vis, nrow=2), global_step)
+            writer.add_image("val/samples_triplet", make_grid(triplets, nrow=3), global_step)
+            writer.add_image("val/samples_generated", make_grid(vis_gen, nrow=2), global_step)
         print(f"wrote {out_dir / fname}")
 
     @torch.no_grad()
