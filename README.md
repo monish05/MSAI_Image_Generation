@@ -59,6 +59,10 @@ From the project root (same directory as `requirements.txt`):
 python -m src.train_ddpm --batch-size 8 --epochs 1 --max-train-steps 500
 # two GPUs
 torchrun --nproc_per_node=2 -m src.train_ddpm --batch-size 8 --epochs 1 --amp
+# resume from explicit checkpoint
+python -m src.train_ddpm --resume checkpoints/ckpt_last.pt --epochs 1
+# resume from best validation checkpoint
+python -m src.train_ddpm --resume-best --epochs 1
 ```
 
-Checkpoints and samples go under `checkpoints/` (gitignored). Override `--train-csv` / `--val-csv` if you used a custom `--out-dir` when building splits.
+Checkpoints and samples go under `checkpoints/` (gitignored). Training now tracks validation loss each epoch and writes `checkpoints/ckpt_best.pt` when it improves, so you can continue from the best model. TensorBoard logs are under `checkpoints/tb/` and step-wise loss CSV logs are in `checkpoints/metrics.csv`. Override `--train-csv` / `--val-csv` if you used a custom `--out-dir` when building splits.

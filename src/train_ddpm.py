@@ -3,13 +3,17 @@
 Train sketch-conditioned DDPM on Sketchy CSV splits.
 Single GPU:  python -m src.train_ddpm
 Two GPUs:    torchrun --nproc_per_node=2 -m src.train_ddpm
+
+Logs: TensorBoard (``checkpoints/tb/``) + ``metrics.csv``. Resume with ``--resume``.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import random
+from datetime import datetime
 from pathlib import Path
 
 import torch
@@ -18,6 +22,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .ddpm import GaussianDDPM
@@ -81,6 +86,28 @@ def main() -> None:
     p.add_argument("--save-every", type=int, default=2000, help="Save checkpoint every N steps (rank 0).")
     p.add_argument("--sample-every", type=int, default=5000, help="Run val sampling every N steps (rank 0).")
     p.add_argument("--max-train-steps", type=int, default=0, help="Stop after this many optimizer steps (0 = no limit).")
+    p.add_argument(
+        "--resume",
+        type=Path,
+        default=None,
+        help="Path to .pt from this trainer (e.g. ckpt_last.pt) to continue training.",
+    )
+    p.add_argument(
+        "--resume-best",
+        action="store_true",
+        help="Resume from save-dir/ckpt_best.pt if --resume is not provided.",
+    )
+    p.add_argument(
+        "--log-every",
+        type=int,
+        default=1,
+        help="Log loss to TensorBoard / metrics.csv every N steps (1 = every step).",
+    )
+    p.add_argument(
+        "--no-tensorboard",
+        action="store_true",
+        help="Disable TensorBoard; metrics.csv is still written when log-every allows.",
+    )
     args = p.parse_args()
 
     ddp, local_rank, rank = setup_distributed()
@@ -125,51 +152,138 @@ def main() -> None:
         args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end
     ).to(device)
 
-    if ddp:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
-
     opt = torch.optim.AdamW(unwrap(model).parameters(), lr=args.lr)
     scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp and torch.cuda.is_available()))
 
-    args.save_dir.mkdir(parents=True, exist_ok=True)
+    resume_path = args.resume
+    if resume_path is None and args.resume_best:
+        candidate = args.save_dir / "ckpt_best.pt"
+        if candidate.is_file():
+            resume_path = candidate
+        elif rank == 0:
+            print(f"--resume-best requested but not found: {candidate}")
+
     global_step = 0
+    best_val_loss = float("inf")
+    if resume_path is not None:
+        if not resume_path.is_file():
+            raise SystemExit(f"--resume not found: {resume_path.resolve()}")
+        try:
+            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
+        except TypeError:
+            ckpt = torch.load(resume_path, map_location=device)
+        unwrap(model).load_state_dict(ckpt["model"], strict=True)
+        opt.load_state_dict(ckpt["opt"])
+        s_state = ckpt.get("scaler")
+        if s_state is not None:
+            scaler.load_state_dict(s_state)
+        global_step = int(ckpt.get("step", 0))
+        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        if rank == 0:
+            print(f"Resumed from {resume_path.resolve()} at global_step={global_step}")
+
+    if ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+
+    args.save_dir.mkdir(parents=True, exist_ok=True)
+    results_dir = args.save_dir / "results"
+    tb_dir = args.save_dir / "tb"
+    metrics_path = args.save_dir / "metrics.csv"
+
+    writer: SummaryWriter | None = None
+    if rank == 0 and not args.no_tensorboard:
+        run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        writer = SummaryWriter(log_dir=str(tb_dir / run_name))
+    if rank == 0:
+        if resume_path is None:
+            with open(metrics_path, "w", newline="") as m:
+                csv.writer(m).writerow(["step", "epoch", "loss"])
+        else:
+            print(f"Appending loss rows to {metrics_path}")
+
+    def log_loss(step: int, epoch: int, loss_val: float) -> None:
+        if rank != 0:
+            return
+        if step % args.log_every != 0:
+            return
+        if writer is not None:
+            writer.add_scalar("train/loss", loss_val, step)
+        with open(metrics_path, "a", newline="") as f:
+            csv.writer(f).writerow([step, epoch, f"{loss_val:.6f}"])
 
     def save_ckpt(tag: str) -> None:
         path = args.save_dir / f"ckpt_{tag}.pt"
-        torch.save(
-            {
-                "model": unwrap(model).state_dict(),
-                "opt": opt.state_dict(),
-                "step": global_step,
-                "args": vars(args),
-            },
-            path,
-        )
+        payload = {
+            "model": unwrap(model).state_dict(),
+            "opt": opt.state_dict(),
+            "scaler": scaler.state_dict() if scaler is not None else None,
+            "step": global_step,
+            "best_val_loss": best_val_loss,
+            "args": vars(args),
+        }
         if rank == 0:
+            torch.save(payload, path)
             print(f"saved {path}")
 
     @torch.no_grad()
-    def sample_val() -> None:
+    def evaluate_val_loss() -> float:
+        unwrap_m = unwrap(model)
+        unwrap_m.eval()
+        losses: list[float] = []
+        for batch in val_loader:
+            photo = batch["photo"].to(device, non_blocking=True)
+            sketch = batch["sketch"].to(device, non_blocking=True)
+            with torch.amp.autocast(
+                device_type="cuda",
+                dtype=torch.float16,
+                enabled=bool(args.amp and torch.cuda.is_available()),
+            ):
+                l = diffusion.training_losses(unwrap_m, photo, sketch)
+            losses.append(float(l.item()))
+        unwrap_m.train()
+        if not losses:
+            return float("inf")
+        return sum(losses) / len(losses)
+
+    @torch.no_grad()
+    def sample_to_dir(out_dir: Path, fname: str) -> None:
+        if rank != 0:
+            return
+        from torchvision.utils import make_grid, save_image
+
         unwrap_m = unwrap(model)
         unwrap_m.eval()
         batch = next(iter(val_loader))
-        sk = batch["sketch"].to(device)[:4]
+        n = min(4, batch["sketch"].shape[0])
+        sk = batch["sketch"].to(device)[:n]
         x_gen = diffusion.sample(unwrap_m, sk)
         unwrap_m.train()
-        out_dir = args.save_dir / "samples"
-        out_dir.mkdir(exist_ok=True)
-        from torchvision.utils import save_image
+        out_dir.mkdir(parents=True, exist_ok=True)
+        vis = (x_gen.clamp(-1, 1) + 1) / 2
+        save_image(vis, out_dir / fname, nrow=2)
+        if writer is not None:
+            writer.add_image("val/samples", make_grid(vis, nrow=2), global_step)
+        print(f"wrote {out_dir / fname}")
 
-        save_image((x_gen.clamp(-1, 1) + 1) / 2, out_dir / f"step_{global_step:07d}.png", nrow=2)
+    @torch.no_grad()
+    def sample_val() -> None:
         if rank == 0:
-            print(f"wrote {out_dir / f'step_{global_step:07d}.png'}")
+            sample_to_dir(args.save_dir / "samples", f"step_{global_step:07d}.png")
+
+    @torch.no_grad()
+    def export_final_results() -> None:
+        sample_to_dir(results_dir, f"final_step_{global_step:07d}.png")
 
     try:
         for epoch in range(args.epochs):
+            if args.max_train_steps and global_step >= args.max_train_steps:
+                break
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
-            pbar = tqdm(train_loader, desc=f"epoch {epoch}", disable=rank != 0)
+            pbar = tqdm(train_loader, desc=f"epoch {epoch}", disable=rank != 0, initial=0)
             for batch in pbar:
+                if args.max_train_steps and global_step >= args.max_train_steps:
+                    break
                 photo = batch["photo"].to(device, non_blocking=True)
                 sketch = batch["sketch"].to(device, non_blocking=True)
                 opt.zero_grad(set_to_none=True)
@@ -185,8 +299,10 @@ def main() -> None:
                 scaler.step(opt)
                 scaler.update()
                 global_step += 1
+                loss_f = float(loss.item())
                 if rank == 0:
-                    pbar.set_postfix(loss=f"{loss.item():.4f}")
+                    pbar.set_postfix(loss=f"{loss_f:.4f}")
+                log_loss(global_step, epoch, loss_f)
                 if rank == 0 and global_step % args.save_every == 0:
                     save_ckpt(f"step{global_step:07d}")
                 if global_step % args.sample_every == 0:
@@ -198,9 +314,22 @@ def main() -> None:
                     break
             if args.max_train_steps and global_step >= args.max_train_steps:
                 break
+            if rank == 0:
+                val_loss = evaluate_val_loss()
+                print(f"epoch {epoch} val_loss={val_loss:.6f}")
+                if writer is not None:
+                    writer.add_scalar("val/loss", val_loss, global_step)
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    save_ckpt("best")
+            if ddp:
+                dist.barrier()
         if rank == 0:
             save_ckpt("last")
+            export_final_results()
     finally:
+        if writer is not None:
+            writer.close()
         cleanup_distributed(ddp)
 
 
