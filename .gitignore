@@ -1,0 +1,6 @@
+data/
+metadata/
+
+.venv/
+checkpoints/
+outputs/

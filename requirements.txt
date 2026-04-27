@@ -1,0 +1,12 @@
+# NVIDIA GPU (CUDA): PyTorch wheels must come from below so pip does not pick CPU-only builds on PyPI.
+# Linux / Windows with a supported driver. Apple Silicon: no CUDA; use MPS/CPU in code instead.
+# Change cu124 to another cu* build if your driver needs it: https://pytorch.org/get-started/locally/
+--index-url https://download.pytorch.org/whl/cu124
+--extra-index-url https://pypi.org/simple
+
+numpy>=1.24
+opencv-python-headless>=4.8
+torch>=2.1
+torchvision>=0.16
+Pillow>=10.0
+tqdm>=4.66
