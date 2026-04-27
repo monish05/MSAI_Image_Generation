@@ -30,10 +30,10 @@ python -c "import torch; print(torch.__version__); print(torch.version.cuda); pr
 
 ## 2. Add Sketchy data (local only)
 
-`data/` is gitignored. You need the Sketchy database (or a repack) with the 256×256 render tree:
+`data/` is gitignored. You need the Sketchy database (or a repack) with 256×256 images laid out as:
 
-- `data/256x256/photo/<tx>/...`
-- `data/256x256/sketch/<tx>/...`
+- `data/photo/<tx>/...`
+- `data/sketch/<tx>/...`
 
 A public Sketchy-style bundle you can start from: [Sketch to Image (Kaggle)](https://www.kaggle.com/datasets/ankitsheoran23/sketch-to-image). If the extracted layout differs, move or symlink files so the paths above match (and keep `photo/` / `sketch/` tx folders consistent).
 

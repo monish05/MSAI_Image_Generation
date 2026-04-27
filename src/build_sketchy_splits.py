@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Build paired (photo, sketch) rows for Sketchy 256x256 with matching tx folders,
+Build paired (photo, sketch) rows for Sketchy 256×256 with matching tx folders,
 then write stratified train/val/test CSVs keyed by image stem (no sketch leakage).
 
-Default: photo/tx_000000000000 + sketch/tx_000000000000 under data/256x256/.
+Default: `data/photo/tx_000000000000` + `data/sketch/tx_000000000000` under the project.
 """
 
 from __future__ import annotations
@@ -102,8 +102,8 @@ def main() -> None:
     p.add_argument(
         "--data-root",
         type=Path,
-        default=ROOT / "data" / "256x256",
-        help="Contains photo/ and sketch/ subdirs.",
+        default=ROOT / "data",
+        help="Contains photo/ and sketch/ subdirs (each with tx folders).",
     )
     p.add_argument(
         "--tx",
