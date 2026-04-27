@@ -59,6 +59,20 @@ def set_seed(seed: int, rank: int = 0) -> None:
     torch.cuda.manual_seed_all(s)
 
 
+def log_distributed_status(ddp: bool, rank: int, local_rank: int, device: torch.device) -> None:
+    world = dist.get_world_size() if ddp and dist.is_initialized() else 1
+    host = os.environ.get("HOSTNAME") or os.environ.get("COMPUTERNAME") or "unknown-host"
+    print(
+        f"[ddp] host={host} rank={rank}/{world} local_rank={local_rank} device={device}",
+        flush=True,
+    )
+    if rank == 0:
+        print(
+            f"[ddp] enabled={ddp} backend={dist.get_backend() if ddp else 'none'} world_size={world}",
+            flush=True,
+        )
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--project-root", type=Path, default=ROOT)
@@ -112,6 +126,7 @@ def main() -> None:
 
     ddp, local_rank, rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
+    log_distributed_status(ddp, rank, local_rank, device)
     if not torch.cuda.is_available():
         print("Warning: CUDA not available; training on CPU will be very slow.")
     set_seed(args.seed, rank)
