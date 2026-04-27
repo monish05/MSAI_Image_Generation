@@ -1,6 +1,6 @@
 # NVIDIA GPU (CUDA): PyTorch wheels must come from below so pip does not pick CPU-only builds on PyPI.
 # Linux / Windows with a supported driver. Apple Silicon: no CUDA; use MPS/CPU in code instead.
-# Change cu124 to another cu* build if your driver needs it: https://pytorch.org/get-started/locally/
+# Change cu121 to another cu* build if your driver needs it: https://pytorch.org/get-started/locally/
 --index-url https://download.pytorch.org/whl/cu121
 --extra-index-url https://pypi.org/simple
 

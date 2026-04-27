@@ -28,6 +28,12 @@ def normalize_m11(x: torch.Tensor) -> torch.Tensor:
     return x * 2.0 - 1.0
 
 
+def _resolve_relpath(root: Path, relpath: str) -> Path:
+    # CSVs may be created on Windows and contain backslashes.
+    normalized = relpath.replace("\\", "/")
+    return root / Path(normalized)
+
+
 class SketchyPairDataset(Dataset):
     """One CSV row = one (photo, sketch) training pair."""
 
@@ -50,8 +56,8 @@ class SketchyPairDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict[str, torch.Tensor | str]:
         row = self.rows[idx]
-        photo_path = self.root / row["photo_relpath"]
-        sketch_path = self.root / row["sketch_relpath"]
+        photo_path = _resolve_relpath(self.root, row["photo_relpath"])
+        sketch_path = _resolve_relpath(self.root, row["sketch_relpath"])
         photo = read_image(str(photo_path))
         if photo.shape[0] == 1:
             photo = photo.repeat(3, 1, 1)
