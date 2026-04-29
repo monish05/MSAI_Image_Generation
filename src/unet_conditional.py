@@ -78,6 +78,37 @@ class Up(nn.Module):
         return self.res(torch.cat([x, skip], dim=1), te)
 
 
+class SelfAttention2d(nn.Module):
+    """Lightweight spatial self-attention at bottleneck resolutions."""
+
+    def __init__(self, channels: int, num_heads: int = 4) -> None:
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.norm = nn.GroupNorm(_gn_groups(channels), channels)
+        self.qkv = nn.Conv1d(channels, channels * 3, kernel_size=1)
+        self.proj = nn.Conv1d(channels, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        b, c, h, w = x.shape
+        y = self.norm(x).reshape(b, c, h * w)
+        q, k, v = self.qkv(y).chunk(3, dim=1)
+        head_dim = c // self.num_heads
+        if head_dim == 0 or c % self.num_heads != 0:
+            return x
+        scale = head_dim ** -0.5
+        q = q.reshape(b, self.num_heads, head_dim, h * w)
+        k = k.reshape(b, self.num_heads, head_dim, h * w)
+        v = v.reshape(b, self.num_heads, head_dim, h * w)
+        attn = torch.softmax(
+            torch.einsum("bhdn,bhdm->bhnm", q, k) * scale,
+            dim=-1,
+        )
+        out = torch.einsum("bhnm,bhdm->bhdn", attn, v).reshape(b, c, h * w)
+        out = self.proj(out).reshape(b, c, h, w)
+        return x + out
+
+
 class ConditionalUNet(nn.Module):
     """
     4 downsamples: 256 -> 128 -> 64 -> 32 -> 16 (works for H=W divisible by 16).
@@ -111,6 +142,7 @@ class ConditionalUNet(nn.Module):
         self.d4 = Down(256, 256, t_emb_dim)
 
         self.mid1 = ResBlock(256, 256, t_emb_dim)
+        self.mid_attn = SelfAttention2d(256, num_heads=4)
         self.mid2 = ResBlock(256, 256, t_emb_dim)
 
         self.u1 = Up(256, 256, 256, t_emb_dim)
@@ -136,6 +168,7 @@ class ConditionalUNet(nn.Module):
         h, sk3 = self.d3(h, te)
         h, sk4 = self.d4(h, te)
         h = self.mid1(h, te)
+        h = self.mid_attn(h)
         h = self.mid2(h, te)
         h = self.u1(h, sk4, te)
         h = self.u2(h, sk3, te)

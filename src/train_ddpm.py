@@ -36,6 +36,13 @@ def unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
 
+@torch.no_grad()
+def update_ema(ema_model: nn.Module, model: nn.Module, decay: float) -> None:
+    msd = unwrap(model).state_dict()
+    for k, ema_v in ema_model.state_dict().items():
+        ema_v.copy_(ema_v * decay + msd[k] * (1.0 - decay))
+
+
 def setup_distributed() -> tuple[bool, int, int]:
     world = int(os.environ.get("WORLD_SIZE", "1"))
     if world <= 1:
@@ -95,7 +102,7 @@ def main() -> None:
     p.add_argument("--beta-start", type=float, default=1e-4)
     p.add_argument("--beta-end", type=float, default=2e-2)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--amp", action="store_true", help="Use bfloat16 autocast (CUDA).")
+    p.add_argument("--amp", action="store_true", help="Use float16 autocast (CUDA).")
     p.add_argument("--save-dir", type=Path, default=ROOT / "checkpoints")
     p.add_argument("--save-every", type=int, default=2000, help="Save checkpoint every N steps (rank 0).")
     p.add_argument("--sample-every", type=int, default=5000, help="Run val sampling every N steps (rank 0).")
@@ -121,6 +128,42 @@ def main() -> None:
         "--no-tensorboard",
         action="store_true",
         help="Disable TensorBoard; metrics.csv is still written when log-every allows.",
+    )
+    p.add_argument(
+        "--ema-decay",
+        type=float,
+        default=0.9999,
+        help="Exponential moving average decay for model weights.",
+    )
+    p.add_argument(
+        "--cond-drop-prob",
+        type=float,
+        default=0.1,
+        help="Probability of dropping sketch condition for CFG-style training.",
+    )
+    p.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=2.0,
+        help="Classifier-free guidance scale used during validation sampling.",
+    )
+    p.add_argument(
+        "--sample-sampler",
+        choices=["ddpm", "ddim"],
+        default="ddim",
+        help="Sampler for validation visualization images.",
+    )
+    p.add_argument(
+        "--sample-steps",
+        type=int,
+        default=100,
+        help="Number of denoising steps when sample-sampler=ddim.",
+    )
+    p.add_argument(
+        "--sample-ddim-eta",
+        type=float,
+        default=0.0,
+        help="DDIM stochasticity for validation sampling; 0 = deterministic.",
     )
     args = p.parse_args()
 
@@ -163,6 +206,9 @@ def main() -> None:
     )
 
     model = ConditionalUNet().to(device)
+    ema_model = ConditionalUNet().to(device)
+    ema_model.load_state_dict(model.state_dict(), strict=True)
+    ema_model.eval()
     diffusion = GaussianDDPM(
         args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end
     ).to(device)
@@ -188,6 +234,11 @@ def main() -> None:
         except TypeError:
             ckpt = torch.load(resume_path, map_location=device)
         unwrap(model).load_state_dict(ckpt["model"], strict=True)
+        ema_state = ckpt.get("ema_model")
+        if ema_state is not None:
+            ema_model.load_state_dict(ema_state, strict=True)
+        else:
+            ema_model.load_state_dict(unwrap(model).state_dict(), strict=True)
         opt.load_state_dict(ckpt["opt"])
         s_state = ckpt.get("scaler")
         if s_state is not None:
@@ -230,6 +281,7 @@ def main() -> None:
         path = args.save_dir / f"ckpt_{tag}.pt"
         payload = {
             "model": unwrap(model).state_dict(),
+            "ema_model": ema_model.state_dict(),
             "opt": opt.state_dict(),
             "scaler": scaler.state_dict() if scaler is not None else None,
             "step": global_step,
@@ -272,7 +324,22 @@ def main() -> None:
         n = min(4, batch["sketch"].shape[0])
         sk = batch["sketch"].to(device)[:n]
         photo = batch["photo"].to(device)[:n]
-        x_gen = diffusion.sample(unwrap_m, sk)
+        if args.sample_sampler == "ddim":
+            x_gen = diffusion.sample_ddim(
+                ema_model,
+                sk,
+                guidance_scale=args.guidance_scale,
+                sample_steps=args.sample_steps,
+                eta=args.sample_ddim_eta,
+            )
+        else:
+            x_gen = diffusion.sample(
+                unwrap_m,
+                sk,
+                use_ema_model=ema_model,
+                guidance_scale=args.guidance_scale,
+                sampler="ddpm",
+            )
         unwrap_m.train()
         out_dir.mkdir(parents=True, exist_ok=True)
         vis_gen = (x_gen.clamp(-1, 1) + 1) / 2
@@ -308,18 +375,27 @@ def main() -> None:
                     break
                 photo = batch["photo"].to(device, non_blocking=True)
                 sketch = batch["sketch"].to(device, non_blocking=True)
+                if args.cond_drop_prob > 0:
+                    keep_mask = (
+                        torch.rand((sketch.shape[0], 1, 1, 1), device=device)
+                        >= args.cond_drop_prob
+                    ).to(sketch.dtype)
+                    sketch_cond = sketch * keep_mask
+                else:
+                    sketch_cond = sketch
                 opt.zero_grad(set_to_none=True)
                 with torch.amp.autocast(
                     device_type="cuda",
                     dtype=torch.float16,
                     enabled=bool(args.amp and torch.cuda.is_available()),
                 ):
-                    loss = diffusion.training_losses(model, photo, sketch)
+                    loss = diffusion.training_losses(model, photo, sketch_cond)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(unwrap(model).parameters(), 1.0)
                 scaler.step(opt)
                 scaler.update()
+                update_ema(ema_model, model, args.ema_decay)
                 global_step += 1
                 loss_f = float(loss.item())
                 if rank == 0:

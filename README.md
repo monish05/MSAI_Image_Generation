@@ -65,4 +65,36 @@ python -m src.train_ddpm --resume checkpoints/ckpt_last.pt --epochs 1
 python -m src.train_ddpm --resume-best --epochs 1
 ```
 
-Checkpoints and samples go under `checkpoints/` (gitignored). Training now tracks validation loss each epoch and writes `checkpoints/ckpt_best.pt` when it improves, so you can continue from the best model. TensorBoard logs are under `checkpoints/tb/` and step-wise loss CSV logs are in `checkpoints/metrics.csv`. Override `--train-csv` / `--val-csv` if you used a custom `--out-dir` when building splits.
+Checkpoints and samples go under `checkpoints/` (gitignored). Training now tracks validation loss each epoch and writes `checkpoints/ckpt_best.pt` when it improves, so you can continue from the best model. It also keeps an EMA copy of weights and uses CFG-style conditioning dropout for stronger sketch conditioning at inference. TensorBoard logs are under `checkpoints/tb/` and step-wise loss CSV logs are in `checkpoints/metrics.csv`. Override `--train-csv` / `--val-csv` if you used a custom `--out-dir` when building splits.
+
+To sample from a checkpoint:
+
+```bash
+# defaults to checkpoints/ckpt_best.pt (falls back to ckpt_last.pt)
+python -m src.sample_from_checkpoint --guidance-scale 2.0 --sampler ddim --sample-steps 100
+```
+
+EMA weights are used automatically when present (add `--no-use-ema` to disable).
+
+## 5. Evaluate checkpoint quality on fixed validation examples
+
+```bash
+python -m src.evaluate_checkpoint \
+  --checkpoint checkpoints/ckpt_best.pt \
+  --num-eval 128 \
+  --num-grid 8 \
+  --sampler ddim \
+  --sample-steps 100 \
+  --guidance-scale 2.0
+```
+
+Outputs:
+- `checkpoints/eval/fixed_val_grid.png`: fixed triplet grid `[sketch | generated | ground-truth]`
+- `checkpoints/eval/eval_metrics.csv`: append-only evaluation log
+- `checkpoints/eval/eval_summary.json`: JSON summary for the latest run
+
+Optional FID/KID (depends on local `torchmetrics` image extras):
+
+```bash
+python -m src.evaluate_checkpoint --checkpoint checkpoints/ckpt_best.pt --compute-fid-kid
+```

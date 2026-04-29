@@ -11,3 +11,4 @@ torchvision>=0.16
 Pillow>=10.0
 tqdm>=4.66
 tensorboard>=2.14
+torchmetrics>=1.4

@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--checkpoint", type=Path, default=None)
     p.add_argument("--project-root", type=Path, default=ROOT)
     p.add_argument(
         "--val-csv",
@@ -36,10 +36,25 @@ def main() -> None:
     p.add_argument("--num-batches", type=int, default=2, help="Batches to draw from val set")
     p.add_argument("--limit-per-batch", type=int, default=4, help="Max sketches per grid")
     p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--guidance-scale", type=float, default=2.0)
+    p.add_argument("--sampler", choices=["ddpm", "ddim"], default="ddim")
+    p.add_argument("--sample-steps", type=int, default=100, help="Used for DDIM sampling.")
+    p.add_argument("--ddim-eta", type=float, default=0.0, help="DDIM stochasticity; 0 = deterministic.")
+    p.add_argument(
+        "--no-use-ema",
+        action="store_true",
+        help="Disable EMA weights even if present in checkpoint.",
+    )
     args = p.parse_args()
 
+    if args.checkpoint is None:
+        best = ROOT / "checkpoints" / "ckpt_best.pt"
+        last = ROOT / "checkpoints" / "ckpt_last.pt"
+        args.checkpoint = best if best.is_file() else last
     if not args.checkpoint.is_file():
-        raise SystemExit(f"Missing checkpoint: {args.checkpoint.resolve()}")
+        raise SystemExit(
+            f"Missing checkpoint: {args.checkpoint.resolve()} (tried ckpt_best.pt/ckpt_last.pt defaults)"
+        )
 
     if args.device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available; using CPU")
@@ -60,6 +75,11 @@ def main() -> None:
     model = ConditionalUNet().to(device)
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
+    ema_model = None
+    if not args.no_use_ema and ckpt.get("ema_model") is not None:
+        ema_model = ConditionalUNet().to(device)
+        ema_model.load_state_dict(ckpt["ema_model"], strict=True)
+        ema_model.eval()
     diffusion = GaussianDDPM(
         timesteps, beta_start=beta_start, beta_end=beta_end
     ).to(device)
@@ -80,7 +100,23 @@ def main() -> None:
         n = min(args.limit_per_batch, batch["sketch"].shape[0])
         sk = batch["sketch"].to(device)[:n]
         with torch.no_grad():
-            x_gen = diffusion.sample(model, sk)
+            if args.sampler == "ddim":
+                used_model = ema_model or model
+                x_gen = diffusion.sample_ddim(
+                    used_model,
+                    sk,
+                    guidance_scale=args.guidance_scale,
+                    sample_steps=args.sample_steps,
+                    eta=args.ddim_eta,
+                )
+            else:
+                x_gen = diffusion.sample(
+                    model,
+                    sk,
+                    use_ema_model=ema_model,
+                    guidance_scale=args.guidance_scale,
+                    sampler="ddpm",
+                )
         vis = (x_gen.clamp(-1, 1) + 1) / 2
         out = args.out_dir / f"sample_batch{b:03d}.png"
         save_image(vis, out, nrow=min(2, n))
