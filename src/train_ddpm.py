@@ -32,6 +32,20 @@ from .unet_conditional import ConditionalUNet
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _make_grad_scaler(enabled: bool):
+    # torch.amp.GradScaler exists in newer PyTorch; torch.cuda.amp.GradScaler in older versions.
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _autocast_ctx(enabled: bool):
+    # torch.amp.autocast exists in newer PyTorch; torch.cuda.amp.autocast in older versions.
+    if hasattr(torch, "amp") and hasattr(torch.amp, "autocast"):
+        return torch.amp.autocast(device_type="cuda", dtype=torch.float16, enabled=enabled)
+    return torch.cuda.amp.autocast(dtype=torch.float16, enabled=enabled)
+
+
 def unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
 
@@ -214,7 +228,7 @@ def main() -> None:
     ).to(device)
 
     opt = torch.optim.AdamW(unwrap(model).parameters(), lr=args.lr)
-    scaler = torch.amp.GradScaler("cuda", enabled=bool(args.amp and torch.cuda.is_available()))
+    scaler = _make_grad_scaler(enabled=bool(args.amp and torch.cuda.is_available()))
 
     resume_path = args.resume
     if resume_path is None and args.resume_best:
@@ -300,11 +314,7 @@ def main() -> None:
         for batch in val_loader:
             photo = batch["photo"].to(device, non_blocking=True)
             sketch = batch["sketch"].to(device, non_blocking=True)
-            with torch.amp.autocast(
-                device_type="cuda",
-                dtype=torch.float16,
-                enabled=bool(args.amp and torch.cuda.is_available()),
-            ):
+            with _autocast_ctx(enabled=bool(args.amp and torch.cuda.is_available())):
                 l = diffusion.training_losses(unwrap_m, photo, sketch)
             losses.append(float(l.item()))
         unwrap_m.train()
@@ -384,11 +394,7 @@ def main() -> None:
                 else:
                     sketch_cond = sketch
                 opt.zero_grad(set_to_none=True)
-                with torch.amp.autocast(
-                    device_type="cuda",
-                    dtype=torch.float16,
-                    enabled=bool(args.amp and torch.cuda.is_available()),
-                ):
+                with _autocast_ctx(enabled=bool(args.amp and torch.cuda.is_available())):
                     loss = diffusion.training_losses(model, photo, sketch_cond)
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
