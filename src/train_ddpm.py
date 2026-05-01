@@ -4,7 +4,7 @@ Train sketch-conditioned DDPM on Sketchy CSV splits.
 Single GPU:  python -m src.train_ddpm
 Two GPUs:    torchrun --nproc_per_node=2 -m src.train_ddpm
 
-Logs: TensorBoard (``checkpoints/tb/``) + ``metrics.csv``. Resume with ``--resume``.
+Logs: TensorBoard (``checkpoints/tb/``) + ``metrics.csv`` (train + val loss). Resume with ``--resume``.
 """
 
 from __future__ import annotations
@@ -48,6 +48,99 @@ def _autocast_ctx(enabled: bool):
 
 def unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
+
+
+def _migrate_legacy_metrics_csv(path: Path) -> None:
+    """Upgrade step,epoch,loss files to step,epoch,train_loss,val_loss (in place)."""
+    if not path.is_file():
+        return
+    with path.open(newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)
+        if header == ["step", "epoch", "train_loss", "val_loss"]:
+            return
+        if header != ["step", "epoch", "loss"]:
+            return
+        rows: list[list[str]] = []
+        for row in reader:
+            if len(row) >= 3:
+                rows.append([row[0], row[1], row[2], ""])
+    with path.open("w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["step", "epoch", "train_loss", "val_loss"])
+        w.writerows(rows)
+
+
+def plot_train_loss_png(metrics_csv: Path, out_png: Path) -> None:
+    """Read checkpoints/metrics.csv and save train + val loss figure (matplotlib)."""
+    if not metrics_csv.is_file():
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("matplotlib not installed; skipping --save-loss-plot.")
+        return
+    train_steps: list[int] = []
+    train_losses: list[float] = []
+    val_steps: list[int] = []
+    val_losses: list[float] = []
+    with metrics_csv.open(newline="") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None or "step" not in reader.fieldnames:
+            return
+        fn = reader.fieldnames
+        train_key = "train_loss" if "train_loss" in fn else "loss"
+        has_val = "val_loss" in fn
+        for row in reader:
+            try:
+                st = int(row["step"])
+            except (KeyError, ValueError):
+                continue
+            tv = row.get(train_key, "").strip()
+            if tv:
+                try:
+                    train_steps.append(st)
+                    train_losses.append(float(tv))
+                except ValueError:
+                    pass
+            if has_val:
+                vv = row.get("val_loss", "").strip()
+                if vv:
+                    try:
+                        val_steps.append(st)
+                        val_losses.append(float(vv))
+                    except ValueError:
+                        pass
+    if not train_steps and not val_steps:
+        return
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(9, 4))
+    if train_steps:
+        plt.plot(train_steps, train_losses, lw=0.8, alpha=0.92, label="train")
+    if val_steps:
+        plt.plot(
+            val_steps,
+            val_losses,
+            marker="o",
+            linestyle="-",
+            lw=1.0,
+            markersize=4,
+            alpha=0.9,
+            label="val (epoch end)",
+        )
+    plt.xlabel("optimizer step")
+    plt.ylabel("loss (noise MSE)")
+    plt.title("Train and validation loss")
+    plt.grid(True, alpha=0.3)
+    if train_steps and val_steps:
+        plt.legend(loc="upper right", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+    print(f"wrote loss plot {out_png}")
 
 
 @torch.no_grad()
@@ -137,8 +230,8 @@ def main() -> None:
     p.add_argument(
         "--save-every",
         type=int,
-        default=2000,
-        help="Save ckpt_stepNNNNNNN.pt every N steps (rank 0). Use 0 to skip and keep only best/last.",
+        default=0,
+        help="If N>0, save ckpt_stepNNNNNNN.pt every N steps (rank 0). Default 0: only best/last checkpoints.",
     )
     p.add_argument("--sample-every", type=int, default=5000, help="Run val sampling every N steps (rank 0).")
     p.add_argument("--max-train-steps", type=int, default=0, help="Stop after this many optimizer steps (0 = no limit).")
@@ -157,12 +250,23 @@ def main() -> None:
         "--log-every",
         type=int,
         default=1,
-        help="Log loss to TensorBoard / metrics.csv every N steps (1 = every step).",
+        help="Log train loss to TensorBoard / metrics.csv every N steps (1 = every step).",
     )
     p.add_argument(
         "--no-tensorboard",
         action="store_true",
         help="Disable TensorBoard; metrics.csv is still written when log-every allows.",
+    )
+    p.add_argument(
+        "--save-loss-plot",
+        action="store_true",
+        help="Save train loss PNG from metrics.csv when the run exits (rank 0).",
+    )
+    p.add_argument(
+        "--loss-plot-path",
+        type=Path,
+        default=None,
+        help="Output PNG for --save-loss-plot (default: save-dir/train_loss.png).",
     )
     p.add_argument(
         "--ema-decay",
@@ -299,17 +403,24 @@ def main() -> None:
     results_dir = args.save_dir / "results"
     tb_dir = args.save_dir / "tb"
     metrics_path = args.save_dir / "metrics.csv"
+    metrics_header = ["step", "epoch", "train_loss", "val_loss"]
 
     writer: SummaryWriter | None = None
     if rank == 0 and not args.no_tensorboard:
         run_name = f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         writer = SummaryWriter(log_dir=str(tb_dir / run_name))
     if rank == 0:
+        if resume_path is not None:
+            _migrate_legacy_metrics_csv(metrics_path)
         if resume_path is None:
             with open(metrics_path, "w", newline="") as m:
-                csv.writer(m).writerow(["step", "epoch", "loss"])
+                csv.writer(m).writerow(metrics_header)
+        elif not metrics_path.is_file():
+            with open(metrics_path, "w", newline="") as m:
+                csv.writer(m).writerow(metrics_header)
+            print(f"created new {metrics_path} (resume with no existing metrics)")
         else:
-            print(f"Appending loss rows to {metrics_path}")
+            print(f"Appending metrics rows to {metrics_path}")
 
     def log_loss(step: int, epoch: int, loss_val: float) -> None:
         if rank != 0:
@@ -319,7 +430,7 @@ def main() -> None:
         if writer is not None:
             writer.add_scalar("train/loss", loss_val, step)
         with open(metrics_path, "a", newline="") as f:
-            csv.writer(f).writerow([step, epoch, f"{loss_val:.6f}"])
+            csv.writer(f).writerow([step, epoch, f"{loss_val:.6f}", ""])
 
     def save_ckpt(tag: str) -> None:
         path = args.save_dir / f"ckpt_{tag}.pt"
@@ -457,6 +568,10 @@ def main() -> None:
                 print(f"epoch {epoch} val_loss={val_loss:.6f}")
                 if writer is not None:
                     writer.add_scalar("val/loss", val_loss, global_step)
+                with open(metrics_path, "a", newline="") as f:
+                    csv.writer(f).writerow(
+                        [global_step, epoch, "", f"{val_loss:.6f}"]
+                    )
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     save_ckpt("best")
@@ -468,6 +583,9 @@ def main() -> None:
     finally:
         if writer is not None:
             writer.close()
+        if rank == 0 and args.save_loss_plot:
+            out_plot = args.loss_plot_path or (args.save_dir / "train_loss.png")
+            plot_train_loss_png(args.save_dir / "metrics.csv", out_plot)
         cleanup_distributed(ddp)
 
 
