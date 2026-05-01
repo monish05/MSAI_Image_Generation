@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import os
 import random
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -26,7 +28,10 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from .ddpm import GaussianDDPM
-from .sketchy_dataset import SketchyPairDataset
+from .sketchy_dataset import (
+    SketchyPairDataset,
+    build_sketch_class_vocab_union,
+)
 from .unet_conditional import ConditionalUNet
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -48,6 +53,18 @@ def _autocast_ctx(enabled: bool):
 
 def unwrap(model: nn.Module) -> nn.Module:
     return model.module if isinstance(model, DDP) else model
+
+
+def _compact_duration(seconds: float) -> str:
+    """Short string for progress-bar timing (avoids wide postfix)."""
+    if seconds < 0:
+        return "0s"
+    if seconds >= 3600:
+        return f"{seconds / 3600:.1f}h"
+    if seconds >= 60:
+        m, s = divmod(int(round(seconds)), 60)
+        return f"{m}m{s:02d}s"
+    return f"{seconds:.0f}s"
 
 
 def _migrate_legacy_metrics_csv(path: Path) -> None:
@@ -221,6 +238,76 @@ def main() -> None:
         help="Keep worker processes alive between epochs (only if num-workers > 0). Cuts epoch-start stalls.",
     )
     p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument(
+        "--lr-schedule",
+        choices=("none", "cosine", "plateau-val"),
+        default="cosine",
+        help=(
+            "none=fixed LR; cosine=warmup then cosine decay by step budget; "
+            "plateau-val=warmup then ReduceLROnPlateau on epoch val loss."
+        ),
+    )
+    p.add_argument(
+        "--lr-warmup-steps",
+        type=int,
+        default=1000,
+        help="Linear LR warmup steps (0 skips). cosine: before decay; plateau-val: before val-based schedule.",
+    )
+    p.add_argument(
+        "--lr-plateau-factor",
+        type=float,
+        default=0.5,
+        help="Multiply LR by this when plateau-val detects no val improvement (ReduceLROnPlateau.factor).",
+    )
+    p.add_argument(
+        "--lr-plateau-patience",
+        type=int,
+        default=3,
+        help="Epochs without val improvement before plateau-val lowers LR.",
+    )
+    p.add_argument(
+        "--lr-plateau-min",
+        type=float,
+        default=1e-6,
+        help="Floor LR under plateau-val (ReduceLROnPlateau.min_lr).",
+    )
+    p.add_argument(
+        "--base-channels",
+        type=int,
+        default=96,
+        help="U-Net width multiplier (legacy checkpoints used 64; must match --resume ckpt architecture).",
+    )
+    p.add_argument(
+        "--no-cross-attention",
+        action="store_true",
+        help="Disable sketch cross-attention at the bottleneck (match older checkpoints without mid_cross_attn).",
+    )
+    p.add_argument(
+        "--no-class-conditioning",
+        action="store_true",
+        help="Disable class embedding (Sketchy folder / CSV class column); match older checkpoints without class_emb.",
+    )
+    p.add_argument(
+        "--class-drop-prob",
+        type=float,
+        default=0.1,
+        help=(
+            "Train-time probability of dropping the class embedding (null token) "
+            "for classifier-free guidance. Ignored with --no-class-conditioning."
+        ),
+    )
+    p.add_argument(
+        "--min-snr-gamma",
+        type=float,
+        default=5.0,
+        help="Min-SNR–style loss reweight over timesteps (0 disables, ~5 recommended).",
+    )
+    p.add_argument(
+        "--lpips-weight",
+        type=float,
+        default=0.05,
+        help="Auxiliary LPIPS on predicted x₀ (0 disables). Requires `pip install lpips`. Uses extra VRAM.",
+    )
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--beta-start", type=float, default=1e-4)
     p.add_argument("--beta-end", type=float, default=2e-2)
@@ -313,11 +400,94 @@ def main() -> None:
         print("Warning: CUDA not available; training on CPU will be very slow.")
     set_seed(args.seed, rank)
 
+    resume_path = args.resume
+    if resume_path is None and args.resume_best:
+        candidate = args.save_dir / "ckpt_best.pt"
+        if candidate.is_file():
+            resume_path = candidate
+        elif rank == 0:
+            print(f"--resume-best requested but not found: {candidate}")
+
+    resume_ckpt = None
+    if resume_path is not None:
+        if not resume_path.is_file():
+            raise SystemExit(f"--resume not found: {resume_path.resolve()}")
+        try:
+            resume_ckpt = torch.load(
+                resume_path, map_location=device, weights_only=False
+            )
+        except TypeError:
+            resume_ckpt = torch.load(resume_path, map_location=device)
+
+    use_cross_attn = not args.no_cross_attention
+    has_class_emb = False
+    if resume_ckpt is not None:
+        has_cross_chk = any(
+            k.startswith("mid_cross_attn.") for k in resume_ckpt["model"]
+        )
+        if has_cross_chk != use_cross_attn:
+            if rank == 0:
+                print(
+                    "[train] Resuming checkpoint: aligning use_cross_attention="
+                    f"{has_cross_chk} with saved weights (CLI default may differ)."
+                )
+            use_cross_attn = has_cross_chk
+        has_class_emb = any(
+            k.startswith("class_emb.") for k in resume_ckpt["model"]
+        )
+
+    if has_class_emb:
+        raw_vocab = resume_ckpt.get("class_vocab")
+        ck_args = resume_ckpt.get("args") or {}
+        class_vocab_any = raw_vocab or ck_args.get("class_vocab") or ck_args.get(
+            "class_to_idx"
+        )
+        if not isinstance(class_vocab_any, dict) or not class_vocab_any:
+            raise SystemExit(
+                "Checkpoint has class_emb weights but no saved class_vocab. "
+                "Use a checkpoint from this codebase version or disable class conditioning."
+            )
+        class_vocab = {str(k): int(v) for k, v in class_vocab_any.items()}
+        num_semantic_classes = len(class_vocab)
+        emb_rows = resume_ckpt["model"]["class_emb.weight"].shape[0]
+        if emb_rows != num_semantic_classes + 1:
+            raise SystemExit(
+                f"class_vocab size {num_semantic_classes} mismatches "
+                f"class_emb ({emb_rows - 1} semantic + null)."
+            )
+    elif resume_ckpt is not None:
+        class_vocab = None
+        num_semantic_classes = 0
+        if rank == 0 and not args.no_class_conditioning:
+            print(
+                "[train] Resuming checkpoint without class_emb: class conditioning "
+                "disabled for strict load compatibility. Train from scratch for class_emb.",
+                flush=True,
+            )
+    elif args.no_class_conditioning:
+        class_vocab = None
+        num_semantic_classes = 0
+    else:
+        class_vocab = build_sketch_class_vocab_union(
+            args.train_csv,
+            args.val_csv,
+        )
+        num_semantic_classes = len(class_vocab)
+
+    args.num_semantic_classes = num_semantic_classes
+    args.class_vocab = class_vocab
+
     train_ds = SketchyPairDataset(
-        args.train_csv, args.project_root, image_size=args.image_size
+        args.train_csv,
+        args.project_root,
+        image_size=args.image_size,
+        class_to_idx=class_vocab,
     )
     val_ds = SketchyPairDataset(
-        args.val_csv, args.project_root, image_size=args.image_size
+        args.val_csv,
+        args.project_root,
+        image_size=args.image_size,
+        class_to_idx=class_vocab,
     )
 
     if ddp:
@@ -346,6 +516,43 @@ def main() -> None:
         drop_last=True,
         **lk,
     )
+
+    steps_per_epoch = len(train_loader)
+    planned_steps = args.epochs * max(steps_per_epoch, 1)
+    if getattr(args, "max_train_steps", 0):
+        planned_steps = min(planned_steps, int(args.max_train_steps))
+    total_opt_steps = max(1, planned_steps)
+
+    def learning_rate_at(global_step_completed: int) -> float:
+        """LR for optimizer step ``global_step_completed`` (cosine or none schedules only)."""
+        lr = args.lr
+        if args.lr_schedule != "cosine":
+            return lr
+        W = max(1, args.lr_warmup_steps)
+        if args.lr_warmup_steps > 0 and global_step_completed < args.lr_warmup_steps:
+            return lr * float(global_step_completed + 1) / float(W)
+        t = global_step_completed - max(0, args.lr_warmup_steps)
+        T_floor = max(0, args.lr_warmup_steps)
+        T = max(1, total_opt_steps - T_floor)
+        return lr * 0.5 * (1.0 + math.cos(math.pi * float(t) / float(T)))
+
+    def apply_lr(global_step_completed: int) -> None:
+        if args.lr_schedule == "plateau-val":
+            W = args.lr_warmup_steps
+            if W <= 0:
+                return
+            if global_step_completed < W:
+                lr_now = args.lr * float(global_step_completed + 1) / float(W)
+                for pg in opt.param_groups:
+                    pg["lr"] = lr_now
+            elif global_step_completed == W:
+                for pg in opt.param_groups:
+                    pg["lr"] = args.lr
+            return
+        lr_now = learning_rate_at(global_step_completed)
+        for pg in opt.param_groups:
+            pg["lr"] = lr_now
+
     val_loader = DataLoader(
         val_ds,
         batch_size=min(4, args.batch_size),
@@ -353,48 +560,91 @@ def main() -> None:
         **lk,
     )
 
-    model = ConditionalUNet().to(device)
-    ema_model = ConditionalUNet().to(device)
+    model = ConditionalUNet(
+        base_channels=args.base_channels,
+        use_cross_attention=use_cross_attn,
+        num_semantic_classes=num_semantic_classes,
+    ).to(device)
+    ema_model = ConditionalUNet(
+        base_channels=args.base_channels,
+        use_cross_attention=use_cross_attn,
+        num_semantic_classes=num_semantic_classes,
+    ).to(device)
     ema_model.load_state_dict(model.state_dict(), strict=True)
     ema_model.eval()
     diffusion = GaussianDDPM(
         args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end
     ).to(device)
 
-    opt = torch.optim.AdamW(unwrap(model).parameters(), lr=args.lr)
-    scaler = _make_grad_scaler(enabled=bool(args.amp and torch.cuda.is_available()))
+    lpips_net: nn.Module | None = None
+    min_snr = float(args.min_snr_gamma) if args.min_snr_gamma > 0 else None
+    if args.lpips_weight > 0:
+        try:
+            import lpips  # pip install lpips
+        except ImportError:
+            raise SystemExit(
+                "lpips_weight > 0 requires the `lpips` package (pip install lpips)."
+            )
+        lpips_net = lpips.LPIPS(net="alex").to(device)
+        for p in lpips_net.parameters():
+            p.requires_grad = False
+        lpips_net.eval()
 
-    resume_path = args.resume
-    if resume_path is None and args.resume_best:
-        candidate = args.save_dir / "ckpt_best.pt"
-        if candidate.is_file():
-            resume_path = candidate
-        elif rank == 0:
-            print(f"--resume-best requested but not found: {candidate}")
+    opt = torch.optim.AdamW(unwrap(model).parameters(), lr=args.lr)
+    plateau_scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau | None = None
+    if args.lr_schedule == "plateau-val":
+        plateau_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="min",
+            factor=float(args.lr_plateau_factor),
+            patience=int(args.lr_plateau_patience),
+            min_lr=float(args.lr_plateau_min),
+            threshold=1e-4,
+        )
+
+    scaler = _make_grad_scaler(enabled=bool(args.amp and torch.cuda.is_available()))
 
     global_step = 0
     best_val_loss = float("inf")
-    if resume_path is not None:
-        if not resume_path.is_file():
-            raise SystemExit(f"--resume not found: {resume_path.resolve()}")
-        try:
-            ckpt = torch.load(resume_path, map_location=device, weights_only=False)
-        except TypeError:
-            ckpt = torch.load(resume_path, map_location=device)
-        unwrap(model).load_state_dict(ckpt["model"], strict=True)
-        ema_state = ckpt.get("ema_model")
+    if resume_ckpt is not None:
+        unwrap(model).load_state_dict(resume_ckpt["model"], strict=True)
+        ema_state = resume_ckpt.get("ema_model")
         if ema_state is not None:
             ema_model.load_state_dict(ema_state, strict=True)
         else:
             ema_model.load_state_dict(unwrap(model).state_dict(), strict=True)
-        opt.load_state_dict(ckpt["opt"])
-        s_state = ckpt.get("scaler")
+        opt.load_state_dict(resume_ckpt["opt"])
+        s_state = resume_ckpt.get("scaler")
         if s_state is not None:
             scaler.load_state_dict(s_state)
-        global_step = int(ckpt.get("step", 0))
-        best_val_loss = float(ckpt.get("best_val_loss", float("inf")))
+        global_step = int(resume_ckpt.get("step", 0))
+        best_val_loss = float(resume_ckpt.get("best_val_loss", float("inf")))
+        psd = resume_ckpt.get("lr_plateau_scheduler")
+        if plateau_scheduler is not None and isinstance(psd, dict):
+            plateau_scheduler.load_state_dict(psd)
         if rank == 0:
-            print(f"Resumed from {resume_path.resolve()} at global_step={global_step}")
+            print(
+                f"Resumed from {resume_path.resolve()} at global_step={global_step}"
+            )
+
+    apply_lr(global_step)
+
+    if rank == 0:
+        pl_msg = ""
+        if args.lr_schedule == "plateau-val":
+            pl_msg = (
+                f" lr_plateau_factor={args.lr_plateau_factor} "
+                f"lr_plateau_patience={args.lr_plateau_patience} "
+                f"lr_plateau_min={args.lr_plateau_min}"
+            )
+        print(
+            f"[train] base_channels={args.base_channels} use_cross_attention={use_cross_attn} "
+            f"num_semantic_classes={num_semantic_classes} "
+            f"min_snr_gamma={min_snr} lpips_weight={args.lpips_weight} "
+            f"lr_schedule={args.lr_schedule} lr_warmup_steps={args.lr_warmup_steps}{pl_msg} "
+            f"total_opt_steps≈{total_opt_steps}",
+            flush=True,
+        )
 
     if ddp:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank)
@@ -422,13 +672,17 @@ def main() -> None:
         else:
             print(f"Appending metrics rows to {metrics_path}")
 
-    def log_loss(step: int, epoch: int, loss_val: float) -> None:
+    def log_loss(
+        step: int, epoch: int, loss_val: float, lr_val: float | None = None
+    ) -> None:
         if rank != 0:
             return
         if step % args.log_every != 0:
             return
         if writer is not None:
             writer.add_scalar("train/loss", loss_val, step)
+            if lr_val is not None:
+                writer.add_scalar("train/lr", lr_val, step)
         with open(metrics_path, "a", newline="") as f:
             csv.writer(f).writerow([step, epoch, f"{loss_val:.6f}", ""])
 
@@ -442,6 +696,12 @@ def main() -> None:
             "step": global_step,
             "best_val_loss": best_val_loss,
             "args": vars(args),
+            "class_vocab": class_vocab,
+            "lr_plateau_scheduler": (
+                plateau_scheduler.state_dict()
+                if plateau_scheduler is not None
+                else None
+            ),
         }
         if rank == 0:
             torch.save(payload, path)
@@ -455,8 +715,19 @@ def main() -> None:
         for batch in val_loader:
             photo = batch["photo"].to(device, non_blocking=True)
             sketch = batch["sketch"].to(device, non_blocking=True)
+            cid = (
+                batch["class_id"].to(device, non_blocking=True)
+                if num_semantic_classes > 0
+                else None
+            )
             with _autocast_ctx(enabled=bool(args.amp and torch.cuda.is_available())):
-                l = diffusion.training_losses(unwrap_m, photo, sketch)
+                l = diffusion.training_losses(
+                    unwrap_m,
+                    photo,
+                    sketch,
+                    min_snr_gamma=min_snr,
+                    class_id=cid,
+                )
             losses.append(float(l.item()))
         unwrap_m.train()
         if not losses:
@@ -475,6 +746,11 @@ def main() -> None:
         n = min(4, batch["sketch"].shape[0])
         sk = batch["sketch"].to(device)[:n]
         photo = batch["photo"].to(device)[:n]
+        cid_samples = (
+            batch["class_id"].to(device)[:n]
+            if num_semantic_classes > 0
+            else None
+        )
         if args.sample_sampler == "ddim":
             x_gen = diffusion.sample_ddim(
                 ema_model,
@@ -482,6 +758,7 @@ def main() -> None:
                 guidance_scale=args.guidance_scale,
                 sample_steps=args.sample_steps,
                 eta=args.sample_ddim_eta,
+                class_id=cid_samples,
             )
         else:
             x_gen = diffusion.sample(
@@ -490,6 +767,7 @@ def main() -> None:
                 use_ema_model=ema_model,
                 guidance_scale=args.guidance_scale,
                 sampler="ddpm",
+                class_id=cid_samples,
             )
         unwrap_m.train()
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -520,12 +798,24 @@ def main() -> None:
                 break
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
-            pbar = tqdm(train_loader, desc=f"epoch {epoch}", disable=rank != 0, initial=0)
+            epoch_t0 = time.perf_counter()
+            pbar = tqdm(
+                train_loader,
+                desc=f"epoch {epoch}",
+                disable=rank != 0,
+                initial=0,
+                dynamic_ncols=True,
+            )
             for batch in pbar:
                 if args.max_train_steps and global_step >= args.max_train_steps:
                     break
                 photo = batch["photo"].to(device, non_blocking=True)
                 sketch = batch["sketch"].to(device, non_blocking=True)
+                cid = (
+                    batch["class_id"].to(device, non_blocking=True)
+                    if num_semantic_classes > 0
+                    else None
+                )
                 if args.cond_drop_prob > 0:
                     keep_mask = (
                         torch.rand((sketch.shape[0], 1, 1, 1), device=device)
@@ -534,9 +824,33 @@ def main() -> None:
                     sketch_cond = sketch * keep_mask
                 else:
                     sketch_cond = sketch
+                if (
+                    cid is not None
+                    and args.class_drop_prob > 0
+                    and num_semantic_classes > 0
+                ):
+                    null_i = int(unwrap(model).null_class_index)
+                    rm = torch.rand((cid.shape[0],), device=device) >= (
+                        args.class_drop_prob
+                    )
+                    cid = torch.where(
+                        rm,
+                        cid,
+                        torch.full_like(cid, null_i),
+                    )
+                apply_lr(global_step)
+                lr_for_step = opt.param_groups[0]["lr"]
                 opt.zero_grad(set_to_none=True)
                 with _autocast_ctx(enabled=bool(args.amp and torch.cuda.is_available())):
-                    loss = diffusion.training_losses(model, photo, sketch_cond)
+                    loss = diffusion.training_losses(
+                        model,
+                        photo,
+                        sketch_cond,
+                        min_snr_gamma=min_snr,
+                        perceptual_weight=args.lpips_weight,
+                        lpips_module=lpips_net,
+                        class_id=cid,
+                    )
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(unwrap(model).parameters(), 1.0)
@@ -546,8 +860,24 @@ def main() -> None:
                 global_step += 1
                 loss_f = float(loss.item())
                 if rank == 0:
-                    pbar.set_postfix(loss=f"{loss_f:.4f}")
-                log_loss(global_step, epoch, loss_f)
+                    ep_elapsed = time.perf_counter() - epoch_t0
+                    total_it = getattr(pbar, "total", None)
+                    n_done = pbar.n
+                    if (
+                        total_it
+                        and n_done > 0
+                        and n_done < total_it
+                    ):
+                        ep_eta = (ep_elapsed / n_done) * (total_it - n_done)
+                        eta_s = _compact_duration(ep_eta)
+                    else:
+                        eta_s = "—"
+                    pbar.set_postfix(
+                        loss=f"{loss_f:.4f}",
+                        ep_elapsed=_compact_duration(ep_elapsed),
+                        ep_eta=eta_s,
+                    )
+                log_loss(global_step, epoch, loss_f, lr_for_step)
                 if (
                     rank == 0
                     and args.save_every > 0
@@ -563,17 +893,31 @@ def main() -> None:
                     break
             if args.max_train_steps and global_step >= args.max_train_steps:
                 break
+            epoch_train_s = time.perf_counter() - epoch_t0
+            val_buf = torch.zeros(1, device=device, dtype=torch.float64)
             if rank == 0:
-                val_loss = evaluate_val_loss()
-                print(f"epoch {epoch} val_loss={val_loss:.6f}")
+                val_buf[0] = evaluate_val_loss()
+            if ddp:
+                dist.broadcast(val_buf, src=0)
+            val_loss_epoch = float(val_buf.item())
+            if plateau_scheduler is not None:
+                plateau_scheduler.step(val_loss_epoch)
+            if rank == 0:
+                lr_now_pg = opt.param_groups[0]["lr"]
+                print(
+                    f"epoch {epoch} train_wall={_compact_duration(epoch_train_s)} "
+                    f"val_loss={val_loss_epoch:.6f} lr={lr_now_pg:.2e}",
+                    flush=True,
+                )
                 if writer is not None:
-                    writer.add_scalar("val/loss", val_loss, global_step)
+                    writer.add_scalar("val/loss", val_loss_epoch, global_step)
+                    writer.add_scalar("train/lr_epoch_end", lr_now_pg, global_step)
                 with open(metrics_path, "a", newline="") as f:
                     csv.writer(f).writerow(
-                        [global_step, epoch, "", f"{val_loss:.6f}"]
+                        [global_step, epoch, "", f"{val_loss_epoch:.6f}"]
                     )
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                if val_loss_epoch < best_val_loss:
+                    best_val_loss = val_loss_epoch
                     save_ckpt("best")
             if ddp:
                 dist.barrier()

@@ -69,6 +69,21 @@ Checkpoints and samples go under `checkpoints/` (gitignored). Training now track
 
 **Resolution:** training defaults to **`--image-size 64`** (images are resized from disk for faster runs). Use **`--image-size 256`** when you want full-resolution training; sampling and `evaluate_checkpoint` must use the **same** `--image-size` as the checkpoint was trained with.
 
+**Richer training recipe (defaults on new runs):**
+
+- **`--base-channels`** (default **96**): wider U-Net than the original 64-wide model. Checkpoint `args` stores this; **`sample_from_checkpoint` / `evaluate_checkpoint` read it automatically** (legacy checkpoints without the field use **64**, or pass `--base-channels 64` if you resume an old 64-wide run with a new codebase).
+- **`--lr-schedule cosine`** with **`--lr-warmup-steps 1000`** (defaults): LR starts small, warms to `--lr`, then decays to zero by the planned step count.
+- **`--min-snr-gamma 5.0`** (set **`0`** to disable): timestep SNR reweighting for noise-prediction training.
+- **`--lpips-weight 0.05`** (set **`0`** to disable): auxiliary LPIPS loss on predicted **`x₀`** (AlexNet backbone; needs `lpips` from `requirements.txt`, extra VRAM). If you omit the package, run with **`--lpips-weight 0`** or install **`lpips`**.
+
+Example full run:
+
+```bash
+python -m src.train_ddpm --batch-size 8 --epochs 50 --amp
+```
+
+To match an **old 64-wide** checkpoint without that field in `args`: add **`--base-channels 64`** to training and inference. For less GPU memory: **`--base-channels 64 --lpips-weight 0`**.
+
 By default **no** `ckpt_step*.pt` files are written (only `ckpt_best.pt` and `ckpt_last.pt`). To also save periodic step checkpoints, pass e.g. `--save-every 2000`. Delete old step files with `rm checkpoints/ckpt_step*.pt` (PowerShell: `Remove-Item checkpoints\ckpt_step*.pt`).
 
 **Throughput / parallel loading:** use more CPU workers and overlap I/O with the GPU, for example `--num-workers 8 --persistent-workers --prefetch-factor 4`. Multi-GPU data parallel training is `torchrun --nproc_per_node=N -m src.train_ddpm ...` (NCCL must work on your setup). Put the dataset on a fast local disk (avoid slow network mounts).

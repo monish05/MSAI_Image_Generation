@@ -24,6 +24,20 @@ from .unet_conditional import ConditionalUNet
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _infer_class_vocab_eval(ckpt: dict, saved: dict) -> dict[str, int] | None:
+    if not any(k.startswith("class_emb.") for k in ckpt["model"]):
+        return None
+    raw = ckpt.get("class_vocab") or saved.get("class_vocab") or saved.get(
+        "class_to_idx"
+    )
+    if not isinstance(raw, dict) or not raw:
+        raise SystemExit(
+            "Checkpoint expects class embedding but lacks class_vocab. "
+            "Re-save from training with class_vocab in the checkpoint file."
+        )
+    return {str(k): int(v) for k, v in raw.items()}
+
+
 def _to_uint8(x_m11: torch.Tensor) -> torch.Tensor:
     x01 = (x_m11.clamp(-1, 1) + 1.0) / 2.0
     return (x01 * 255.0).round().clamp(0, 255).to(torch.uint8)
@@ -60,6 +74,12 @@ def main() -> None:
     p.add_argument("--sampler", choices=["ddpm", "ddim"], default="ddim")
     p.add_argument("--sample-steps", type=int, default=100)
     p.add_argument("--ddim-eta", type=float, default=0.0)
+    p.add_argument(
+        "--base-channels",
+        type=int,
+        default=None,
+        help="U-Net width (default: from checkpoint train args, else 64 for legacy).",
+    )
     p.add_argument("--compute-fid-kid", action="store_true")
     p.add_argument("--out-dir", type=Path, default=ROOT / "checkpoints" / "eval")
     args = p.parse_args()
@@ -77,13 +97,31 @@ def main() -> None:
     timesteps = int(saved.get("timesteps", 1000))
     beta_start = float(saved.get("beta_start", 1e-4))
     beta_end = float(saved.get("beta_end", 2e-2))
+    base_ch = (
+        int(args.base_channels)
+        if args.base_channels is not None
+        else int(saved.get("base_channels", 64))
+    )
+    use_cross_attn = any(
+        k.startswith("mid_cross_attn.") for k in ckpt["model"]
+    )
+    class_vocab = _infer_class_vocab_eval(ckpt, saved)
+    num_cls = len(class_vocab) if class_vocab is not None else 0
 
-    model = ConditionalUNet().to(device)
+    model = ConditionalUNet(
+        base_channels=base_ch,
+        use_cross_attention=use_cross_attn,
+        num_semantic_classes=num_cls,
+    ).to(device)
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
     ema_model = None
     if ckpt.get("ema_model") is not None:
-        ema_model = ConditionalUNet().to(device)
+        ema_model = ConditionalUNet(
+            base_channels=base_ch,
+            use_cross_attention=use_cross_attn,
+            num_semantic_classes=num_cls,
+        ).to(device)
         ema_model.load_state_dict(ckpt["ema_model"], strict=True)
         ema_model.eval()
     use_model = ema_model or model
@@ -94,7 +132,12 @@ def main() -> None:
         beta_end=beta_end,
     ).to(device)
 
-    ds = SketchyPairDataset(args.val_csv, args.project_root, image_size=args.image_size)
+    ds = SketchyPairDataset(
+        args.val_csv,
+        args.project_root,
+        image_size=args.image_size,
+        class_to_idx=class_vocab,
+    )
     if len(ds) == 0:
         raise SystemExit(f"Validation CSV contains no rows: {args.val_csv}")
 
@@ -133,6 +176,7 @@ def main() -> None:
         for batch in eval_loader:
             sk = batch["sketch"].to(device)
             gt = batch["photo"].to(device)
+            cid = batch["class_id"].to(device) if num_cls > 0 else None
             if args.sampler == "ddim":
                 pred = diffusion.sample_ddim(
                     use_model,
@@ -140,6 +184,7 @@ def main() -> None:
                     guidance_scale=args.guidance_scale,
                     sample_steps=args.sample_steps,
                     eta=args.ddim_eta,
+                    class_id=cid,
                 )
             else:
                 pred = diffusion.sample(
@@ -147,6 +192,7 @@ def main() -> None:
                     sk,
                     guidance_scale=args.guidance_scale,
                     sampler="ddpm",
+                    class_id=cid,
                 )
             abs_l1_sum += torch.abs(pred - gt).mean(dim=(1, 2, 3)).sum().item()
             count += pred.shape[0]
@@ -170,6 +216,9 @@ def main() -> None:
         grid_batch = next(iter(grid_loader))
         sk = grid_batch["sketch"].to(device)
         gt = grid_batch["photo"].to(device)
+        gid = (
+            grid_batch["class_id"].to(device) if num_cls > 0 else None
+        )
         if args.sampler == "ddim":
             pred = diffusion.sample_ddim(
                 use_model,
@@ -177,6 +226,7 @@ def main() -> None:
                 guidance_scale=args.guidance_scale,
                 sample_steps=args.sample_steps,
                 eta=args.ddim_eta,
+                class_id=gid,
             )
         else:
             pred = diffusion.sample(
@@ -184,6 +234,7 @@ def main() -> None:
                 sk,
                 guidance_scale=args.guidance_scale,
                 sampler="ddpm",
+                class_id=gid,
             )
         vis_sk = ((sk.clamp(-1, 1) + 1) / 2).repeat(1, 3, 1, 1)
         vis_pred = (pred.clamp(-1, 1) + 1) / 2

@@ -34,6 +34,29 @@ def _resolve_relpath(root: Path, relpath: str) -> Path:
     return root / Path(normalized)
 
 
+def build_sketch_class_vocab(csv_path: Path) -> dict[str, int]:
+    """Sorted unique ``class`` column values -> contiguous ids ``0 .. n-1``."""
+    classes: set[str] = set()
+    with Path(csv_path).open(newline="") as f:
+        for row in csv.DictReader(f):
+            if "class" in row:
+                classes.add(row["class"])
+    return {name: i for i, name in enumerate(sorted(classes))}
+
+
+def build_sketch_class_vocab_union(*csv_paths: Path) -> dict[str, int]:
+    """Union of class names across several CSV splits (sorted -> ids)."""
+    classes: set[str] = set()
+    for csv_path in csv_paths:
+        if not Path(csv_path).is_file():
+            continue
+        with Path(csv_path).open(newline="") as f:
+            for row in csv.DictReader(f):
+                if "class" in row:
+                    classes.add(row["class"])
+    return {name: i for i, name in enumerate(sorted(classes))}
+
+
 class SketchyPairDataset(Dataset):
     """One CSV row = one (photo, sketch) training pair."""
 
@@ -42,10 +65,12 @@ class SketchyPairDataset(Dataset):
         csv_path: Path,
         root: Path,
         image_size: int | None = None,
+        class_to_idx: dict[str, int] | None = None,
     ) -> None:
         super().__init__()
         self.root = Path(root).resolve()
         self.image_size = image_size
+        self.class_to_idx = class_to_idx
         self.rows: list[dict[str, str]] = []
         with Path(csv_path).open(newline="") as f:
             for row in csv.DictReader(f):
@@ -76,9 +101,20 @@ class SketchyPairDataset(Dataset):
             photo_f = resize(photo_f, [self.image_size, self.image_size])
             sketch_gray = resize(sketch_gray, [self.image_size, self.image_size])
 
-        return {
+        out: dict[str, torch.Tensor | str] = {
             "photo": normalize_m11(photo_f),
             "sketch": normalize_m11(sketch_gray),
             "class": row["class"],
             "stem": row["stem"],
         }
+        if self.class_to_idx is not None:
+            cls_key = row["class"]
+            if cls_key not in self.class_to_idx:
+                raise KeyError(
+                    f"Unknown class '{cls_key}' — not in class_to_idx (check CSV vs checkpoint vocab)."
+                )
+            out["class_id"] = torch.tensor(
+                self.class_to_idx[cls_key],
+                dtype=torch.long,
+            )
+        return out

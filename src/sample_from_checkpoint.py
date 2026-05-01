@@ -22,6 +22,20 @@ from .unet_conditional import ConditionalUNet
 ROOT = Path(__file__).resolve().parent.parent
 
 
+def _infer_class_vocab(ckpt: dict, saved: dict) -> dict[str, int] | None:
+    if not any(k.startswith("class_emb.") for k in ckpt["model"]):
+        return None
+    raw = ckpt.get("class_vocab") or saved.get("class_vocab") or saved.get(
+        "class_to_idx"
+    )
+    if not isinstance(raw, dict) or not raw:
+        raise SystemExit(
+            "Checkpoint expects class embedding but lacks class_vocab. "
+            "Re-save checkpoints from training with an updated codebase."
+        )
+    return {str(k): int(v) for k, v in raw.items()}
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", type=Path, default=None)
@@ -45,6 +59,12 @@ def main() -> None:
     p.add_argument("--sampler", choices=["ddpm", "ddim"], default="ddim")
     p.add_argument("--sample-steps", type=int, default=100, help="Used for DDIM sampling.")
     p.add_argument("--ddim-eta", type=float, default=0.0, help="DDIM stochasticity; 0 = deterministic.")
+    p.add_argument(
+        "--base-channels",
+        type=int,
+        default=None,
+        help="U-Net width (default: from checkpoint train args, else 64 for legacy).",
+    )
     p.add_argument(
         "--no-use-ema",
         action="store_true",
@@ -76,13 +96,31 @@ def main() -> None:
     timesteps = int(saved.get("timesteps", 1000))
     beta_start = float(saved.get("beta_start", 1e-4))
     beta_end = float(saved.get("beta_end", 2e-2))
+    base_ch = (
+        int(args.base_channels)
+        if args.base_channels is not None
+        else int(saved.get("base_channels", 64))
+    )
+    use_cross_attn = any(
+        k.startswith("mid_cross_attn.") for k in ckpt["model"]
+    )
+    class_vocab = _infer_class_vocab(ckpt, saved)
+    num_cls = len(class_vocab) if class_vocab is not None else 0
 
-    model = ConditionalUNet().to(device)
+    model = ConditionalUNet(
+        base_channels=base_ch,
+        use_cross_attention=use_cross_attn,
+        num_semantic_classes=num_cls,
+    ).to(device)
     model.load_state_dict(ckpt["model"], strict=True)
     model.eval()
     ema_model = None
     if not args.no_use_ema and ckpt.get("ema_model") is not None:
-        ema_model = ConditionalUNet().to(device)
+        ema_model = ConditionalUNet(
+            base_channels=base_ch,
+            use_cross_attention=use_cross_attn,
+            num_semantic_classes=num_cls,
+        ).to(device)
         ema_model.load_state_dict(ckpt["ema_model"], strict=True)
         ema_model.eval()
     diffusion = GaussianDDPM(
@@ -90,7 +128,10 @@ def main() -> None:
     ).to(device)
 
     val_ds = SketchyPairDataset(
-        args.val_csv, args.project_root, image_size=args.image_size
+        args.val_csv,
+        args.project_root,
+        image_size=args.image_size,
+        class_to_idx=class_vocab,
     )
     val_loader = DataLoader(val_ds, batch_size=max(1, args.limit_per_batch), shuffle=True)
 
@@ -104,6 +145,9 @@ def main() -> None:
             batch = next(it)
         n = min(args.limit_per_batch, batch["sketch"].shape[0])
         sk = batch["sketch"].to(device)[:n]
+        cid = (
+            batch["class_id"].to(device)[:n] if num_cls > 0 else None
+        )
         with torch.no_grad():
             if args.sampler == "ddim":
                 used_model = ema_model or model
@@ -113,6 +157,7 @@ def main() -> None:
                     guidance_scale=args.guidance_scale,
                     sample_steps=args.sample_steps,
                     eta=args.ddim_eta,
+                    class_id=cid,
                 )
             else:
                 x_gen = diffusion.sample(
@@ -121,6 +166,7 @@ def main() -> None:
                     use_ema_model=ema_model,
                     guidance_scale=args.guidance_scale,
                     sampler="ddpm",
+                    class_id=cid,
                 )
         vis = (x_gen.clamp(-1, 1) + 1) / 2
         out = args.out_dir / f"sample_batch{b:03d}.png"
