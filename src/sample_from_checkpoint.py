@@ -31,7 +31,12 @@ def main() -> None:
         type=Path,
         default=ROOT / "metadata" / "sketchy_tx000" / "val.csv",
     )
-    p.add_argument("--image-size", type=int, default=256)
+    p.add_argument(
+        "--image-size",
+        type=int,
+        default=64,
+        help="Must match training --image-size.",
+    )
     p.add_argument("--out-dir", type=Path, default=ROOT / "outputs" / "samples")
     p.add_argument("--num-batches", type=int, default=2, help="Batches to draw from val set")
     p.add_argument("--limit-per-batch", type=int, default=4, help="Max sketches per grid")

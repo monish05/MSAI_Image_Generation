@@ -45,7 +45,12 @@ def main() -> None:
         type=Path,
         default=ROOT / "metadata" / "sketchy_tx000" / "val.csv",
     )
-    p.add_argument("--image-size", type=int, default=256)
+    p.add_argument(
+        "--image-size",
+        type=int,
+        default=64,
+        help="Must match training --image-size.",
+    )
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--num-grid", type=int, default=8, help="Fixed examples for visual triplet grid.")
     p.add_argument("--num-eval", type=int, default=128, help="Validation examples to evaluate.")

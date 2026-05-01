@@ -111,7 +111,7 @@ class SelfAttention2d(nn.Module):
 
 class ConditionalUNet(nn.Module):
     """
-    4 downsamples: 256 -> 128 -> 64 -> 32 -> 16 (works for H=W divisible by 16).
+    4 downsamples: H -> H/2 -> ... (requires H=W divisible by 16, e.g. 64 or 256).
     """
 
     def __init__(

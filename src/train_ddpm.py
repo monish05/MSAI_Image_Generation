@@ -107,10 +107,26 @@ def main() -> None:
         type=Path,
         default=ROOT / "metadata" / "sketchy_tx000" / "val.csv",
     )
-    p.add_argument("--image-size", type=int, default=256)
+    p.add_argument(
+        "--image-size",
+        type=int,
+        default=64,
+        help="Train on H×W square crops (resized from disk). Default 64 for faster iteration.",
+    )
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--num-workers", type=int, default=4)
+    p.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=4,
+        help="Batches each worker pre-loads (only used if num-workers > 0). Higher can hide I/O latency.",
+    )
+    p.add_argument(
+        "--persistent-workers",
+        action="store_true",
+        help="Keep worker processes alive between epochs (only if num-workers > 0). Cuts epoch-start stalls.",
+    )
     p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--timesteps", type=int, default=1000)
     p.add_argument("--beta-start", type=float, default=1e-4)
@@ -118,7 +134,12 @@ def main() -> None:
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--amp", action="store_true", help="Use float16 autocast (CUDA).")
     p.add_argument("--save-dir", type=Path, default=ROOT / "checkpoints")
-    p.add_argument("--save-every", type=int, default=2000, help="Save checkpoint every N steps (rank 0).")
+    p.add_argument(
+        "--save-every",
+        type=int,
+        default=2000,
+        help="Save ckpt_stepNNNNNNN.pt every N steps (rank 0). Use 0 to skip and keep only best/last.",
+    )
     p.add_argument("--sample-every", type=int, default=5000, help="Run val sampling every N steps (rank 0).")
     p.add_argument("--max-train-steps", type=int, default=0, help="Stop after this many optimizer steps (0 = no limit).")
     p.add_argument(
@@ -202,21 +223,30 @@ def main() -> None:
         train_sampler = None
         shuffle = True
 
+    def _loader_kwargs() -> dict:
+        kw: dict = {
+            "num_workers": args.num_workers,
+            "pin_memory": torch.cuda.is_available(),
+        }
+        if args.num_workers > 0:
+            kw["persistent_workers"] = bool(args.persistent_workers)
+            kw["prefetch_factor"] = max(2, int(args.prefetch_factor))
+        return kw
+
+    lk = _loader_kwargs()
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=shuffle,
         sampler=train_sampler,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
         drop_last=True,
+        **lk,
     )
     val_loader = DataLoader(
         val_ds,
         batch_size=min(4, args.batch_size),
         shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
+        **lk,
     )
 
     model = ConditionalUNet().to(device)
@@ -407,7 +437,11 @@ def main() -> None:
                 if rank == 0:
                     pbar.set_postfix(loss=f"{loss_f:.4f}")
                 log_loss(global_step, epoch, loss_f)
-                if rank == 0 and global_step % args.save_every == 0:
+                if (
+                    rank == 0
+                    and args.save_every > 0
+                    and global_step % args.save_every == 0
+                ):
                     save_ckpt(f"step{global_step:07d}")
                 if global_step % args.sample_every == 0:
                     if rank == 0:

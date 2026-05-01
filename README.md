@@ -67,6 +67,12 @@ python -m src.train_ddpm --resume-best --epochs 1
 
 Checkpoints and samples go under `checkpoints/` (gitignored). Training now tracks validation loss each epoch and writes `checkpoints/ckpt_best.pt` when it improves, so you can continue from the best model. It also keeps an EMA copy of weights and uses CFG-style conditioning dropout for stronger sketch conditioning at inference. TensorBoard logs are under `checkpoints/tb/` and step-wise loss CSV logs are in `checkpoints/metrics.csv`. Override `--train-csv` / `--val-csv` if you used a custom `--out-dir` when building splits.
 
+**Resolution:** training defaults to **`--image-size 64`** (images are resized from disk for faster runs). Use **`--image-size 256`** when you want full-resolution training; sampling and `evaluate_checkpoint` must use the **same** `--image-size` as the checkpoint was trained with.
+
+To save disk space, pass `--save-every 0` so only `ckpt_best.pt` and `ckpt_last.pt` are written (no `ckpt_step*.pt`). Delete old step checkpoints from `checkpoints/` with `rm checkpoints/ckpt_step*.pt` (PowerShell: `Remove-Item checkpoints\ckpt_step*.pt`).
+
+**Throughput / parallel loading:** use more CPU workers and overlap I/O with the GPU, for example `--num-workers 8 --persistent-workers --prefetch-factor 4`. Multi-GPU data parallel training is `torchrun --nproc_per_node=N -m src.train_ddpm ...` (NCCL must work on your setup). Put the dataset on a fast local disk (avoid slow network mounts).
+
 To sample from a checkpoint:
 
 ```bash
