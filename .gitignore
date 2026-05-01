@@ -4,6 +4,7 @@ data/
 metadata/
 
 .venv/
+.winvenv/
 checkpoints/
 outputs/
 
