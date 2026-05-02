@@ -1,8 +1,13 @@
-# NVIDIA GPU (CUDA): PyTorch wheels must come from below so pip does not pick CPU-only builds on PyPI.
-# Linux / Windows with a supported driver. Apple Silicon: no CUDA; use MPS/CPU in code instead.
-# Change cu121 to another cu* build if your driver needs it: https://pytorch.org/get-started/locally/
---index-url https://download.pytorch.org/whl/cu121
---extra-index-url https://pypi.org/simple
+# Python deps for genai_test on a typical Linux HPC node.
+#
+# PyTorch: many clusters provide CUDA builds via environment modules or conda.
+# If `pip install` is allowed, install a wheel that matches the node’s CUDA *before*
+# this file, for example (pick cu* to match https://pytorch.org/get-started/locally/):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# If a cluster module already provides torch/torchvision, `pip install -r requirements.txt`
+# will usually leave those satisfied; install any remaining lines the resolver reports.
+#
+# Do not pin a private PyTorch index here — air-gapped or module-based systems break on it.
 
 numpy>=1.24
 opencv-python-headless>=4.8
@@ -12,5 +17,4 @@ Pillow>=10.0
 tqdm>=4.66
 tensorboard>=2.14
 torchmetrics>=1.4
-matplotlib>=3.8
 lpips>=0.1.4

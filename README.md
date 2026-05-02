@@ -1,125 +1,24 @@
-# MSAI_395_Image_Generation
+# CelebA sketch-conditioned diffusion
 
-Structure-Guided Diffusion with Noise-Space Steering for Controllable Image Generation
+Trains \(\varepsilon_\theta(x_t,\,t\,|\,\texttt{sketch})\) on aligned Celeb faces; sketches use the dodge pipeline like [`../sketch-to-image/image2sketch.ipynb`](../sketch-to-image/image2sketch.ipynb).
 
-All Python code for this part of the project lives under `src/`. This README walks through setup and training from zero.
+Put CelebA under [`data/`](data/) (`list_eval_partition.csv`, `img_align_celeba/` — nested layout auto-detected). Gitignored.
 
-## 0. Get the project
-
-```bash
-cd /path/to/your/clone
-# optional: use a venv
-python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-```
-
-## 1. Install dependencies
+**From `genai_test/`:**
 
 ```bash
-pip install -U pip
-pip install -r requirements.txt
+python -m src.train --data-root ./data --batch-size 8 --drop-sketch-prob 0.1 --sample-every 2000
 ```
 
-This pulls **CUDA-enabled** PyTorch for NVIDIA GPUs (see comments in `requirements.txt`). If you use another CUDA line, adjust the `--index-url` and reinstall.
+At startup training prints **`planned_steps`** (= `epochs × batches_per_epoch`, or capped by **`--max-steps`**). **LPIPS** turns on automatically at **half that count** (`λ` ramp fixed in code). Use **`--no-lpips`** to train with noise loss only.
 
-Quick check (optional):
+| Flag | Meaning |
+|------|---------|
+| `--drop-sketch-prob` | CFG dropout on sketch conditioning. |
+| `--guidance-scale` | Sampling / FID DDIM CFG weight. |
+| `--fid-every N` | Optional FID log → `checkpoints/fid_history.csv`. |
+| `--sample-every N` | Triplet PNGs in `checkpoints/samples/`. |
+| `--amp` | Mixed precision on CUDA. |
+| `--no-lpips` | Disable midpoint LPIPS. |
 
-```bash
-python -c "import torch; print(torch.__version__); print(torch.version.cuda); print('cuda:', torch.cuda.is_available())"
-```
-
-## 2. Add Sketchy data (local only)
-
-`data/` is gitignored. You need the Sketchy database (or a repack) with 256×256 images laid out as:
-
-- `data/photo/<tx>/...`
-- `data/sketch/<tx>/...`
-
-A public Sketchy-style bundle you can start from: [Sketch to Image (Kaggle)](https://www.kaggle.com/datasets/ankitsheoran23/sketch-to-image). If the extracted layout differs, move or symlink files so the paths above match (and keep `photo/` / `sketch/` tx folders consistent).
-
-The default in this project uses `tx_000000000000` (see `data/README.txt` for what each `tx` means).
-
-## 3. Build train/val/test CSVs (not in git)
-
-`metadata/` is gitignored. Generate manifests from your local `data/`:
-
-```bash
-python -m src.build_sketchy_splits
-# optional flags: --data-root ... --out-dir ... --tx tx_000000000000
-```
-
-This writes `metadata/sketchy_tx000/train.csv`, `val.csv`, `test.csv` (and `split_stats.json`) under the project root, with paths **relative to the project root** so training finds images under `data/`.
-
-## 4. Train (single or multi-GPU)
-
-From the project root (same directory as `requirements.txt`):
-
-```bash
-# one GPU
-python -m src.train_ddpm --batch-size 8 --epochs 1 --max-train-steps 500
-# two GPUs
-torchrun --nproc_per_node=2 -m src.train_ddpm --batch-size 8 --epochs 1 --amp
-# resume from explicit checkpoint
-python -m src.train_ddpm --resume checkpoints/ckpt_last.pt --epochs 1
-# resume from best validation checkpoint
-python -m src.train_ddpm --resume-best --epochs 1
-```
-
-Checkpoints and samples go under `checkpoints/` (gitignored). Training now tracks validation loss each epoch and writes `checkpoints/ckpt_best.pt` when it improves, so you can continue from the best model. It also keeps an EMA copy of weights and uses CFG-style conditioning dropout for stronger sketch conditioning at inference. TensorBoard logs are under `checkpoints/tb/`; `checkpoints/metrics.csv` logs **train** loss (per `--log-every`) and **val** loss (one row per epoch end). Override `--train-csv` / `--val-csv` if you used a custom `--out-dir` when building splits.
-
-**Resolution:** training defaults to **`--image-size 64`** (images are resized from disk for faster runs). Use **`--image-size 256`** when you want full-resolution training; sampling and `evaluate_checkpoint` must use the **same** `--image-size` as the checkpoint was trained with.
-
-**Richer training recipe (defaults on new runs):**
-
-- **`--base-channels`** (default **96**): wider U-Net than the original 64-wide model. Checkpoint `args` stores this; **`sample_from_checkpoint` / `evaluate_checkpoint` read it automatically** (legacy checkpoints without the field use **64**, or pass `--base-channels 64` if you resume an old 64-wide run with a new codebase).
-- **`--lr-schedule cosine`** with **`--lr-warmup-steps 1000`** (defaults): LR starts small, warms to `--lr`, then decays to zero by the planned step count.
-- **`--min-snr-gamma 5.0`** (set **`0`** to disable): timestep SNR reweighting for noise-prediction training.
-- **`--lpips-weight 0.05`** (set **`0`** to disable): auxiliary LPIPS loss on predicted **`x₀`** (AlexNet backbone; needs `lpips` from `requirements.txt`, extra VRAM). If you omit the package, run with **`--lpips-weight 0`** or install **`lpips`**.
-
-Example full run:
-
-```bash
-python -m src.train_ddpm --batch-size 8 --epochs 50 --amp
-```
-
-To match an **old 64-wide** checkpoint without that field in `args`: add **`--base-channels 64`** to training and inference. For less GPU memory: **`--base-channels 64 --lpips-weight 0`**.
-
-By default **no** `ckpt_step*.pt` files are written (only `ckpt_best.pt` and `ckpt_last.pt`). To also save periodic step checkpoints, pass e.g. `--save-every 2000`. Delete old step files with `rm checkpoints/ckpt_step*.pt` (PowerShell: `Remove-Item checkpoints\ckpt_step*.pt`).
-
-**Throughput / parallel loading:** use more CPU workers and overlap I/O with the GPU, for example `--num-workers 8 --persistent-workers --prefetch-factor 4`. Multi-GPU data parallel training is `torchrun --nproc_per_node=N -m src.train_ddpm ...` (NCCL must work on your setup). Put the dataset on a fast local disk (avoid slow network mounts).
-
-**Loss plot:** add `--save-loss-plot` to write `checkpoints/train_loss.png` (train + val curves) from `metrics.csv` when the job exits (requires `matplotlib`). Use `--loss-plot-path PATH` to override the PNG path.
-
-**CSV vs TensorBoard:** both record **train** and **val** loss; `metrics.csv` is easy to archive and plot without launching TensorBoard.
-
-To sample from a checkpoint:
-
-```bash
-# defaults to checkpoints/ckpt_best.pt (falls back to ckpt_last.pt)
-python -m src.sample_from_checkpoint --guidance-scale 2.0 --sampler ddim --sample-steps 100
-```
-
-EMA weights are used automatically when present (add `--no-use-ema` to disable).
-
-## 5. Evaluate checkpoint quality on fixed validation examples
-
-```bash
-python -m src.evaluate_checkpoint \
-  --checkpoint checkpoints/ckpt_best.pt \
-  --num-eval 128 \
-  --num-grid 8 \
-  --sampler ddim \
-  --sample-steps 100 \
-  --guidance-scale 2.0
-```
-
-Outputs:
-- `checkpoints/eval/fixed_val_grid.png`: fixed triplet grid `[sketch | generated | ground-truth]`
-- `checkpoints/eval/eval_metrics.csv`: append-only evaluation log
-- `checkpoints/eval/eval_summary.json`: JSON summary for the latest run
-
-Optional FID/KID (depends on local `torchmetrics` image extras):
-
-```bash
-python -m src.evaluate_checkpoint --checkpoint checkpoints/ckpt_best.pt --compute-fid-kid
-```
+Defaults: **`--epochs 50`**, **`--data-root`** = `./data`. Install PyTorch for your CUDA, then `pip install -r requirements.txt`.

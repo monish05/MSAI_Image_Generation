@@ -1,1 +1,1 @@
-"""Sketchy conditional DDPM."""
+"""CelebA sketch-conditioned pixel diffusion."""
