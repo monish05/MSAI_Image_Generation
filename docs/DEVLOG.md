@@ -158,9 +158,7 @@ Shared defaults currently documented there include:
 
 ---
 
-## Hyperparameter results (fill when run finishes)
-
-<!-- TODO: Fill placeholders after final run analysis -->
+## Hyperparameter results
 
 ### Stage 1 baseline
 
@@ -168,37 +166,38 @@ Source: [`../checkpoints/stage1_baseline/`](../checkpoints/stage1_baseline/)
 
 | Metric | Value |
 |---|---|
-| `last_step` | TODO |
-| `val_loss` | TODO |
-| `val_psnr` | TODO |
-| `test_psnr_db` | TODO |
-| `test_ddpm_loss` | TODO |
+| `last_step` | 1,093,500 |
+| `val_loss` | 0.018936 |
+| `val_psnr` | 28.11 |
+| `test_psnr_db` | 29.17 |
+| `test_ddpm_loss` | 0.01652 |
 | Triplet PNG | [`../checkpoints/stage1_baseline/eval_test/test_triplets.png`](../checkpoints/stage1_baseline/eval_test/test_triplets.png) |
-| Notes | TODO |
+| Notes | Reference run; long schedule (~1.09M steps), FID 37.57 at `guidance_scale=1.2`, `sample_steps=200`. |
 
 ### Stage 2 table
 
-| Run | Override | val_loss | val_psnr | test_psnr_db | Notes |
-|---|---|---:|---:|---:|---|
-| H00_baseline | none | TODO | TODO | TODO | TODO |
-| H01_lr_low | `--lr 1e-4` | TODO | TODO | TODO | TODO |
-| H02_lr_high | `--lr 3e-4` | TODO | TODO | TODO | TODO |
-| H03_batch_16 | `--batch-size 16` | TODO | TODO | TODO | TODO |
-| H04_epochs_plus | `--epochs 55` | TODO | TODO | TODO | TODO |
-| H05_drop_sketch_high | `--drop-sketch-prob 0.2` | TODO | TODO | TODO | TODO |
-| H06_guidance_high | `--guidance-scale 2.0` | TODO | TODO | TODO | TODO |
-| H07_sample_steps_fast | `--sample-steps 120` | TODO | TODO | TODO | TODO |
-| H08_lpips_late | `--lpips-start-frac 0.25` | TODO | TODO | TODO | TODO |
-| H09_color_strong | `--color-loss-weight 0.05`, `--color-loss-start-frac 0.45` | TODO | TODO | TODO | TODO |
-| H10_linear_schedule | `--beta-schedule linear` | TODO | TODO | TODO | TODO |
-| H11_min_snr_5 | `--min-snr-gamma 5` | TODO | TODO | TODO | TODO |
+| Run | Override | val_loss | val_psnr | test_psnr_db | test_fid | Notes |
+|---|---|---:|---:|---:|---:|---|
+| H00_baseline | none | 0.017219 | 28.55 | 29.12 | 88.47 | reference |
+| H01_lr_low | `--lr 1e-4` | 0.017991 | 28.49 | 29.04 | 95.41 | slightly worse than baseline |
+| H02_lr_high | `--lr 3e-4` | 0.017893 | 28.56 | 29.12 | 100.52 | matches baseline PSNR; FID worse |
+| H03_batch_16 | `--batch-size 16` | 0.018118 | 28.59 | 29.13 | 93.31 | best val_psnr & test_psnr; ran 2x steps (336,875) |
+| H04_epochs_plus | `--epochs 55` | 0.018161 | 28.29 | 28.29 | 184.21 | stopped early at 120,285 steps; weakest |
+| H05_drop_sketch_high | `--drop-sketch-prob 0.2` | 0.017297 | 28.38 | 28.94 | 107.77 | slight regression |
+| H06_guidance_high | `--guidance-scale 2.0` | 0.017458 | 28.38 | 28.94 | 180.67 | PSNR ~baseline, FID hurt |
+| H07_sample_steps_fast | `--sample-steps 120` | 0.017408 | 28.52 | 28.95 | 72.75 | best test_fid |
+| H08_lpips_late | `--lpips-start-frac 0.25` | 0.017387 | 28.48 | 28.99 | 97.93 | near baseline |
+| H09_color_strong | `--color-loss-weight 0.05`, `--color-loss-start-frac 0.45` | 0.018681 | 28.23 | 28.14 | 127.04 | stronger color loss hurts both metrics |
+| H10_linear_schedule | `--beta-schedule linear` | 0.009757 | 21.49 | 23.78 | 215.51 | low val_loss is misleading; PSNR & FID much worse |
+| H11_min_snr_5 | `--min-snr-gamma 5` | 0.005337 | 28.49 | 28.99 | 116.68 | val_loss not comparable (Min-SNR reweighting); PSNR ~baseline |
 
 ### Selection placeholders
 
-- Best numeric run: `TODO`
-- Best visual run (rubric): `TODO`
-- Stage-B follow-up plan: `TODO`
-- Best Tier-A combo (`sample_steps`, `guidance_scale`): `TODO`
+- Best numeric run: `H03_batch_16` on `val_psnr` (28.59) and `test_psnr_db` (29.13). Caveats: `H11_min_snr_5`'s `val_loss` (0.005337) and `H10_linear_schedule`'s `val_loss` (0.009757) are not directly comparable to other runs because Min-SNR and the linear schedule change the loss weighting; H10's PSNR/FID confirm it is actually worse.
+- Best `test_fid`: `H07_sample_steps_fast` (72.75).
+- Best visual run (rubric): `TODO - awaiting side-by-side rubric scoring of triplet PNGs in checkpoints/hp_H*/eval_test/`.
+- Stage-B follow-up plan: re-run Tier-A eval grid for `H03_batch_16`, `H07_sample_steps_fast`, and `H00_baseline` using `scripts/run_tier_a_eval_grid.sh`; rubric scoring on top-3 visual outputs; if `H03_batch_16` confirms, sweep `batch-size` and longer training.
+- Best Tier-A combo (`sample_steps`, `guidance_scale`): `TODO - pending Tier-A grid runs`.
 
 ---
 

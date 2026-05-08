@@ -357,6 +357,11 @@ def main() -> None:
     ap.add_argument("--no-psnr-plot", action="store_true")
     ap.add_argument("--psnr-plot-path", type=Path, default=None)
     ap.add_argument("--triplet-channel-swap-debug", action="store_true")
+    ap.add_argument(
+        "--resume",
+        action="store_true",
+        help="If save-dir/ckpt_last.pt exists, load weights, optimizer, scaler, step, and epoch and continue.",
+    )
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -454,6 +459,44 @@ def main() -> None:
     global_step = 0
     best_val = float("inf")
     bad_epochs = 0
+    start_epoch = 0
+
+    resume_path = save_dir / "ckpt_last.pt"
+    if args.resume and resume_path.is_file():
+        try:
+            ck = torch.load(resume_path, map_location=device, weights_only=False)
+        except TypeError:
+            ck = torch.load(resume_path, map_location=device)
+        model.load_state_dict(ck["model"])
+        ema.load_state_dict(ck["ema"])
+        global_step = int(ck.get("step", 0))
+        if "epoch" in ck:
+            start_epoch = int(ck["epoch"]) + 1
+        else:
+            start_epoch = min(global_step // max(steps_per_epoch, 1), args.epochs)
+            print(
+                f"[train] resume: checkpoint has no 'epoch'; inferred start_epoch={start_epoch} from step",
+                flush=True,
+            )
+        if ck.get("optimizer"):
+            opt.load_state_dict(ck["optimizer"])
+        if use_amp and ck.get("scaler") is not None:
+            scaler.load_state_dict(ck["scaler"])
+        best_val = float(ck.get("best_val", float("inf")))
+        bad_epochs = int(ck.get("bad_epochs", 0))
+        print(
+            f"[train] resumed from {resume_path}  step={global_step}  start_epoch={start_epoch}  "
+            f"best_val={best_val}  bad_epochs={bad_epochs}",
+            flush=True,
+        )
+    elif args.resume:
+        print(f"[train] --resume set but no {resume_path}; training from scratch.", flush=True)
+
+    if start_epoch >= args.epochs:
+        print(
+            f"[train] start_epoch={start_epoch} >= epochs={args.epochs}; skipping epoch loop.",
+            flush=True,
+        )
     fields_m = [
         "step",
         "epoch",
@@ -546,7 +589,7 @@ def main() -> None:
             ["step", "fid", "guidance_scale", "drop_sketch_prob", "cfg_used", "num_samples"],
         )
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         model.train()
         epoch_start = time.perf_counter()
         last_loss_f = float("nan")
@@ -616,16 +659,22 @@ def main() -> None:
         if improved:
             best_val = vloss
             bad_epochs = 0
-            torch.save(
-                {"model": model.state_dict(), "ema": ema.state_dict(), "step": global_step, "args": vars(args)},
-                save_dir / "ckpt_best.pt",
-            )
         else:
             bad_epochs += 1
-        torch.save(
-            {"model": model.state_dict(), "ema": ema.state_dict(), "step": global_step, "args": vars(args)},
-            save_dir / "ckpt_last.pt",
-        )
+        ck_common = {
+            "model": model.state_dict(),
+            "ema": ema.state_dict(),
+            "step": global_step,
+            "epoch": epoch,
+            "best_val": best_val,
+            "bad_epochs": bad_epochs,
+            "optimizer": opt.state_dict(),
+            "scaler": scaler.state_dict() if use_amp else None,
+            "args": vars(args),
+        }
+        if improved:
+            torch.save(ck_common, save_dir / "ckpt_best.pt")
+        torch.save(ck_common, save_dir / "ckpt_last.pt")
         if args.max_steps and global_step >= args.max_steps:
             break
         if args.early_stop_patience > 0 and bad_epochs >= args.early_stop_patience:

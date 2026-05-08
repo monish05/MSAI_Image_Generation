@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path("/home/szb9536/genai_test_4")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DATA_ROOT = PROJECT_ROOT / "data"
 PYTHON_EXE = sys.executable
 
@@ -18,6 +18,7 @@ def _has_jpgs(root: Path) -> bool:
 def _pick_image_root(data_root: Path) -> Path:
     candidates = [
         data_root / "img_align_celeba" / "img_align_celeba",
+        data_root / "img_align_celeba",
     ]
     for cand in candidates:
         if cand.is_dir() and _has_jpgs(cand):
@@ -25,17 +26,20 @@ def _pick_image_root(data_root: Path) -> Path:
     for cand in candidates:
         if cand.is_dir():
             return cand
-    return candidates[1]
+    return candidates[-1]
 
 
 IMAGE_ROOT = _pick_image_root(DATA_ROOT)
+
+# Used for notebook-driven `src.eval_test` runs (must match `eval_test --fid` behavior).
+NOTEBOOK_EVAL_FID_MAX = 1024
 
 BASE_ARGS: dict[str, str | None] = {
     "data-root": str(DATA_ROOT),
     "image-root": str(IMAGE_ROOT),
     "image-size": "64",
     "batch-size": "32",
-    "epochs": "100",
+    "epochs": "77",
     "lr": "2e-4",
     "workers": "4",
     "seed": "42",
@@ -54,6 +58,7 @@ BASE_ARGS: dict[str, str | None] = {
     "early-stop-min-delta": "0",
     "max-train-images": "70000",
     "amp": None,
+    "resume": None,
 }
 
 
@@ -69,7 +74,40 @@ def build_cmd(run: dict) -> tuple[list[str], Path]:
         else:
             cmd.extend([f"--{k}", str(v)])
     cmd.extend(run.get("extra_flags", []))
+    # Always append if missing so every case resumes after checkpoint, even when an older
+    # copy of this file (without "resume" in BASE_ARGS) is what notebooks import on disk.
+    if "--resume" not in cmd:
+        cmd.append("--resume")
     return cmd, save_dir
+
+
+def build_eval_cmd(save_dir: Path, *, fid_max: int | None = None) -> list[str] | None:
+    ck = save_dir / "ckpt_best.pt"
+    if not ck.is_file():
+        ck = save_dir / "ckpt_last.pt"
+    if not ck.is_file():
+        return None
+    triplet = save_dir / "eval_test_triplets.png"
+    n_fid = int(fid_max if fid_max is not None else NOTEBOOK_EVAL_FID_MAX)
+    return [
+        PYTHON_EXE,
+        "-m",
+        "src.eval_test",
+        "--ckpt",
+        str(ck),
+        "--data-root",
+        str(DATA_ROOT),
+        "--image-root",
+        str(IMAGE_ROOT),
+        "--out-dir",
+        str(save_dir),
+        "--fid",
+        "--fid-max",
+        str(n_fid),
+        "--fid-strict",
+        "--triplet-png",
+        str(triplet),
+    ]
 
 
 def stream_run(cmd: list[str], cwd: Path) -> int:
@@ -99,8 +137,13 @@ def _last_val_row(metrics_csv: Path) -> dict[str, str]:
     return {}
 
 
-def run_case(case_run: dict, run_now: bool = True) -> None:
+def run_case(case_run: dict, run_now: bool = True, run_eval: bool = True) -> None:
     cmd, save_dir = build_cmd(case_run)
+    raw_fid = case_run.get("eval_fid_max")
+    try:
+        eval_fid_max = int(raw_fid) if raw_fid is not None else None
+    except (TypeError, ValueError):
+        eval_fid_max = None
     print("project=", PROJECT_ROOT)
     print("python=", PYTHON_EXE)
     print("data_root=", DATA_ROOT)
@@ -109,9 +152,23 @@ def run_case(case_run: dict, run_now: bool = True) -> None:
     print("save_dir=", save_dir)
     print("cmd=", shlex.join(cmd))
 
+    train_rc = 0
     if run_now:
-        rc = stream_run(cmd, PROJECT_ROOT)
-        print("returncode=", rc)
+        train_rc = stream_run(cmd, PROJECT_ROOT)
+        print("train returncode=", train_rc)
+
+    # FID is always requested for notebook evals (`--fid` + `--fid-max`).
+    if run_eval and (not run_now or train_rc == 0):
+        ev = build_eval_cmd(save_dir, fid_max=eval_fid_max)
+        if ev is None:
+            print("eval skipped: no ckpt_best.pt or ckpt_last.pt under", save_dir)
+        else:
+            im = ev.index("--fid-max")
+            print(f"eval_test with --fid --fid-max {ev[im + 1]} --fid-strict")
+            ev_rc = stream_run(ev, PROJECT_ROOT)
+            print("eval returncode=", ev_rc)
+    elif run_eval and run_now and train_rc != 0:
+        print("eval skipped: training failed (returncode=", train_rc, ")", sep="")
 
     row = _last_val_row(save_dir / "metrics.csv")
     print("last_step=", row.get("step"))

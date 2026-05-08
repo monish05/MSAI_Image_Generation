@@ -40,6 +40,11 @@ def main() -> None:
     ap.add_argument("--sample-steps", type=int, default=None)
     ap.add_argument("--fid", action="store_true", help="Compute FID on a fixed random subset of test IDs (slow).")
     ap.add_argument("--fid-max", type=int, default=1024)
+    ap.add_argument(
+        "--fid-strict",
+        action="store_true",
+        help="With --fid, exit with code 2 if FID cannot be computed (e.g. torchmetrics missing).",
+    )
     ap.add_argument("--manifest-seed", type=int, default=123)
     ap.add_argument(
         "--triplet-png",
@@ -147,6 +152,12 @@ def main() -> None:
         if fid_v is None:
             print("FID skipped (install torchmetrics or fix FID path).", flush=True)
             summary["fid"] = None
+            if args.fid_strict:
+                print(
+                    "eval_test: --fid --fid-strict requires FID (e.g. pip install torchmetrics; see requirements.txt).",
+                    flush=True,
+                )
+                raise SystemExit(2)
         else:
             summary["fid"] = fid_v
             print(f"test_fid={fid_v:.4f}  n_fid={len(ds_fid)}", flush=True)
