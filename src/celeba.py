@@ -30,9 +30,27 @@ def resolve_image_root(data_root: Path) -> Path:
     raise FileNotFoundError(f"No .jpg under {dire}")
 
 
+def normalize_image_root(data_root: Path, image_root: Path | None) -> Path:
+    """Directory that actually holds *.jpg, including nested CelebA zip layout.
+
+    Official CelebA often extracts to ``img_align_celeba/img_align_celeba/*.jpg``.
+    Passing only the outer folder as ``--image-root`` would otherwise yield 0 files.
+    """
+    root = Path(data_root).resolve()
+    if image_root is None:
+        return resolve_image_root(root)
+    ir = Path(image_root).resolve()
+    if list(ir.glob("*.jpg")):
+        return ir
+    inner = ir / "img_align_celeba"
+    if inner.is_dir() and list(inner.glob("*.jpg")):
+        return inner
+    return ir
+
+
 def list_image_ids_sorted(data_root: Path, partition: int, image_root: Path | None = None) -> list[str]:
     root = Path(data_root).resolve()
-    ir = Path(image_root).resolve() if image_root else resolve_image_root(root)
+    ir = normalize_image_root(root, image_root)
     part_csv = root / "list_eval_partition.csv"
     if not part_csv.is_file():
         raise FileNotFoundError(part_csv)
@@ -64,10 +82,8 @@ class CelebSketchDataset(Dataset):
     ) -> None:
         super().__init__()
         self.data_root = Path(data_root).resolve()
-        self.image_root = (
-            Path(image_root).resolve() if image_root else resolve_image_root(self.data_root)
-        )
-        rows = list_image_ids_sorted(self.data_root, partition, self.image_root)
+        self.image_root = normalize_image_root(self.data_root, image_root)
+        rows = list_image_ids_sorted(self.data_root, partition, image_root)
         if only_filenames is not None:
             want = frozenset(only_filenames)
             rows = [f for f in rows if f in want]

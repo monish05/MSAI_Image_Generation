@@ -4,9 +4,8 @@ data/
 metadata/
 
 .venv/
-.winvenv/
 checkpoints/
-outputs/
+slurm/
 
 __pycache__/
 *.py[cod]

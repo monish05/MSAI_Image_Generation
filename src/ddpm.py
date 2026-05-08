@@ -4,15 +4,42 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+import math
+
+
+def _cosine_alphas_cumprod(timesteps: int, s: float = 0.008) -> torch.Tensor:
+    """Nichol & Dhariwal cosine schedule."""
+    x = torch.linspace(0, timesteps, timesteps + 1, dtype=torch.float64)
+    f = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi / 2) ** 2
+    f = f / f[0]
+    betas = 1.0 - (f[1:] / f[:-1])
+    betas = torch.clamp(betas, max=0.999)
+    alphas = 1.0 - betas
+    return torch.cumprod(alphas, dim=0).to(torch.float32)
 
 
 class GaussianDDPM(nn.Module):
-    def __init__(self, timesteps: int, beta_start: float = 1e-4, beta_end: float = 2e-2) -> None:
+    def __init__(
+        self,
+        timesteps: int,
+        beta_start: float = 1e-4,
+        beta_end: float = 2e-2,
+        beta_schedule: str = "linear",
+    ) -> None:
         super().__init__()
-        betas = torch.linspace(beta_start, beta_end, timesteps)
-        alphas = 1.0 - betas
-        self.register_buffer("alphas_cumprod", torch.cumprod(alphas, dim=0))
+        if beta_schedule == "linear":
+            betas = torch.linspace(beta_start, beta_end, timesteps)
+            alphas = 1.0 - betas
+            alphas_cumprod = torch.cumprod(alphas, dim=0)
+        elif beta_schedule == "cosine":
+            alphas_cumprod = _cosine_alphas_cumprod(timesteps)
+        else:
+            raise ValueError(
+                f"Unknown beta_schedule={beta_schedule!r}; expected 'linear' or 'cosine'."
+            )
+        self.register_buffer("alphas_cumprod", alphas_cumprod)
         self.timesteps = int(timesteps)
+        self.beta_schedule = beta_schedule
 
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor | None = None):
         if noise is None:

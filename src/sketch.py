@@ -8,7 +8,10 @@ import torch
 
 
 def _dodge(image: np.ndarray, mask_inv_blur: np.ndarray) -> np.ndarray:
-    return cv2.divide(image, 255 - mask_inv_blur, scale=256.0)
+    # Avoid div-by-zero when blur saturates (255 - blur -> 0), which yields NaN/inf in divide.
+    denom = 255.0 - mask_inv_blur.astype(np.float32)
+    denom = np.maximum(denom, 1.0)
+    return cv2.divide(image, denom, scale=256.0)
 
 
 def photo_bgr_uint8_to_sketch_gray(image_bgr_u8: np.ndarray, blur_ksize: int = 21) -> np.ndarray:
@@ -16,7 +19,9 @@ def photo_bgr_uint8_to_sketch_gray(image_bgr_u8: np.ndarray, blur_ksize: int = 2
     inv = 255 - gray
     k = blur_ksize | 1
     blur = cv2.GaussianBlur(inv, (k, k), sigmaX=0)
-    dodge = np.clip(_dodge(gray.astype(np.float32), blur.astype(np.float32)), 0, 255)
+    dodge = np.asarray(_dodge(gray.astype(np.float32), blur.astype(np.float32)), dtype=np.float32)
+    dodge = np.nan_to_num(dodge, nan=0.0, posinf=255.0, neginf=0.0)
+    dodge = np.clip(dodge, 0.0, 255.0)
     return dodge.astype(np.uint8)
 
 

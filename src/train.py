@@ -7,11 +7,12 @@ import argparse
 import csv
 import json
 import random
+import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 
 import torch
-from contextlib import nullcontext
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.utils import save_image
@@ -19,7 +20,6 @@ from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# LPIPS aux: starts at half of planned optimizer steps (printed at startup), linear ramp then hold
 LPIPS_LAMBDA_MAX = 0.05
 LPIPS_RAMP_STEPS = 5000
 
@@ -38,7 +38,6 @@ def ema_sync(dst: nn.Module, src: nn.Module, decay: float) -> None:
 
 
 def sketch_cfg_dropout(sketch: torch.Tensor, p: float) -> torch.Tensor:
-    """Null sketch channels = (-1,) in normalized space."""
     if p <= 0:
         return sketch
     b = sketch.shape[0]
@@ -58,25 +57,168 @@ def csv_row(path: Path, cols: dict[str, str], fields: list[str]) -> None:
         w.writerow(cols)
 
 
+def _read_metric_series(
+    metrics_csv: Path, train_col: str, val_col: str
+) -> tuple[list[int], list[float], list[int], list[float]]:
+    st_t: list[int] = []
+    y_t: list[float] = []
+    st_v: list[int] = []
+    y_v: list[float] = []
+    if not metrics_csv.is_file():
+        return st_t, y_t, st_v, y_v
+    with metrics_csv.open(newline="") as fh:
+        for row in csv.DictReader(fh):
+            try:
+                st = int(row["step"])
+            except (KeyError, ValueError):
+                continue
+            tv = (row.get(train_col) or "").strip()
+            if tv:
+                try:
+                    st_t.append(st)
+                    y_t.append(float(tv))
+                except ValueError:
+                    pass
+            vv = (row.get(val_col) or "").strip()
+            if vv:
+                try:
+                    st_v.append(st)
+                    y_v.append(float(vv))
+                except ValueError:
+                    pass
+    return st_t, y_t, st_v, y_v
+
+
+def _plot_metric_png(
+    metrics_csv: Path,
+    out_png: Path,
+    *,
+    train_col: str,
+    val_col: str,
+    y_label: str,
+    title: str,
+) -> None:
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print(f"matplotlib not installed; skip {y_label} PNG", flush=True)
+        return
+
+    st_t, y_t, st_v, y_v = _read_metric_series(metrics_csv, train_col, val_col)
+    if not st_t and not st_v:
+        return
+
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(9, 4))
+    if st_t:
+        ax.plot(st_t, y_t, lw=0.85, alpha=0.9, label="train (logged steps)")
+    if st_v:
+        ax.plot(st_v, y_v, marker="o", ms=3, lw=1.0, alpha=0.9, label="val (epoch end)")
+    ax.set_xlabel("optimizer step")
+    ax.set_ylabel(y_label)
+    ax.set_title(title)
+    ax.grid(True, alpha=0.3)
+    if st_t or st_v:
+        ax.legend(loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=150)
+    plt.close(fig)
+
+
+def save_loss_plot_png(metrics_csv: Path, out_png: Path) -> None:
+    _plot_metric_png(
+        metrics_csv,
+        out_png,
+        train_col="train_loss",
+        val_col="val_loss",
+        y_label="loss",
+        title="Sketch DDPM train / val loss",
+    )
+
+
+def save_psnr_plot_png(metrics_csv: Path, out_png: Path) -> None:
+    _plot_metric_png(
+        metrics_csv,
+        out_png,
+        train_col="train_psnr",
+        val_col="val_psnr",
+        y_label="PSNR (dB)",
+        title="Sketch DDPM train / val PSNR (pred_x0 vs photo)",
+    )
+
+
 def m11_as_float01(x: torch.Tensor) -> torch.Tensor:
     return (x.clamp(-1, 1) + 1.0) * 0.5
 
 
 @torch.no_grad()
+def psnr_pred_x0_db(pred_x0: torch.Tensor, photo: torch.Tensor) -> float:
+    p = m11_as_float01(pred_x0).float()
+    g = m11_as_float01(photo).float()
+    mse = (p - g).pow(2).mean(dim=(1, 2, 3)).clamp(min=1e-12)
+    return float((10.0 * torch.log10(1.0 / mse)).mean().item())
+
+
+def _rgb01_to_lab(rgb: torch.Tensor) -> torch.Tensor:
+    eps = 1e-6
+    rgb = rgb.clamp(0.0, 1.0)
+    a = 0.055
+    rgb_lin = torch.where(rgb <= 0.04045, rgb / 12.92, ((rgb + a) / (1 + a)).pow(2.4))
+
+    r, g, b = rgb_lin[:, 0:1], rgb_lin[:, 1:2], rgb_lin[:, 2:3]
+    x = 0.4124564 * r + 0.3575761 * g + 0.1804375 * b
+    y = 0.2126729 * r + 0.7151522 * g + 0.0721750 * b
+    z = 0.0193339 * r + 0.1191920 * g + 0.9503041 * b
+
+    xn, yn, zn = 0.95047, 1.0, 1.08883
+    x = x / xn
+    y = y / yn
+    z = z / zn
+
+    d = 6 / 29
+    d3 = d**3
+    k = 1 / (3 * d * d)
+
+    def f(t: torch.Tensor) -> torch.Tensor:
+        return torch.where(t > d3, t.clamp_min(eps).pow(1 / 3), k * t + 4 / 29)
+
+    fx, fy, fz = f(x), f(y), f(z)
+    l = 116 * fy - 16
+    aa = 500 * (fx - fy)
+    bb = 200 * (fy - fz)
+    return torch.cat([l, aa, bb], dim=1)
+
+
+def color_ab_l1(pred_x0: torch.Tensor, photo: torch.Tensor) -> torch.Tensor:
+    pred = _rgb01_to_lab(m11_as_float01(pred_x0).float())
+    gt = _rgb01_to_lab(m11_as_float01(photo).float())
+    return (pred[:, 1:] - gt[:, 1:]).abs().mean()
+
+
+@torch.no_grad()
 def validation_pass(
     model: nn.Module, ddpm_module, dl: DataLoader, device: torch.device, min_snr: float | None
-) -> float:
+) -> tuple[float, float]:
+    was_training = model.training
     model.eval()
-    tot = 0.0
+    tot_loss = 0.0
+    tot_psnr = 0.0
     nb = 0
-    for batch in dl:
-        ph = batch["photo"].to(device)
-        sk = batch["sketch"].to(device)
-        loss, _ = ddpm_module.training_losses(model, ph, sk, min_snr_gamma=min_snr)
-        tot += float(loss)
-        nb += 1
-    model.train()
-    return tot / max(nb, 1)
+    try:
+        for batch in dl:
+            ph = batch["photo"].to(device)
+            sk = batch["sketch"].to(device)
+            loss, pred_x0 = ddpm_module.training_losses(model, ph, sk, min_snr_gamma=min_snr)
+            tot_loss += float(loss)
+            tot_psnr += psnr_pred_x0_db(pred_x0, ph)
+            nb += 1
+    finally:
+        model.train(was_training)
+    denom = max(nb, 1)
+    return tot_loss / denom, tot_psnr / denom
 
 
 @torch.no_grad()
@@ -89,20 +231,24 @@ def save_triplets(
     *,
     gs: float,
     steps: int,
+    channel_swap_debug: bool = False,
 ) -> None:
     sk = batch["sketch"].to(device)
     ph = batch["photo"].to(device)
     n = min(4, sk.shape[0])
     sk = sk[:n]
-    fk = diffusion.ddim_sample_loop(
-        ema_m, sk, guidance_scale=gs, steps=steps, eta=0.0
-    )
+    fk = diffusion.ddim_sample_loop(ema_m, sk, guidance_scale=gs, steps=steps, eta=0.0)
     vis_sk = ((sk[:n].clamp(-1, 1) + 1) / 2).repeat(1, 3, 1, 1)
     vis_gt = ((ph[:n].clamp(-1, 1) + 1) / 2)
     vis_g = ((fk[:n].clamp(-1, 1) + 1) / 2)
     trip = torch.stack([vis_sk, vis_g, vis_gt], dim=1).flatten(0, 1).cpu()
     path.parent.mkdir(parents=True, exist_ok=True)
     save_image(trip, path, nrow=3)
+    if channel_swap_debug:
+        vis_swap = vis_g[:, [2, 1, 0], :, :]
+        trip4 = torch.stack([vis_sk, vis_g, vis_swap, vis_gt], dim=1).flatten(0, 1).cpu()
+        swap_path = path.with_name(f"{path.stem}_chswap{path.suffix}")
+        save_image(trip4, swap_path, nrow=4)
 
 
 def lpips_optional(device: torch.device, use: bool) -> nn.Module | None:
@@ -150,7 +296,10 @@ def run_fid_manifest(
         num_workers=min(4, torch.get_num_threads() or 1),
         pin_memory=device.type == "cuda",
     )
-    fid_m = FrechetInceptionDistance(normalize=True).to(device)
+    try:
+        fid_m = FrechetInceptionDistance(normalize=True).to(device)
+    except ModuleNotFoundError:
+        return None
     ema_m.eval()
     for batch in dl:
         real = batch["photo"].to(device)
@@ -170,6 +319,7 @@ def main() -> None:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", type=Path, default=ROOT / "data")
+    ap.add_argument("--image-root", type=Path, default=None)
     ap.add_argument("--save-dir", type=Path, default=ROOT / "checkpoints")
     ap.add_argument("--image-size", type=int, default=64)
     ap.add_argument("--batch-size", type=int, default=8)
@@ -181,6 +331,7 @@ def main() -> None:
     ap.add_argument("--timesteps", type=int, default=1000)
     ap.add_argument("--beta-start", type=float, default=1e-4)
     ap.add_argument("--beta-end", type=float, default=2e-2)
+    ap.add_argument("--beta-schedule", type=str, default="linear", choices=["linear", "cosine"])
     ap.add_argument("--base-channels", type=int, default=96)
     ap.add_argument("--ema-decay", type=float, default=0.9999)
     ap.add_argument("--drop-sketch-prob", type=float, default=0.1)
@@ -192,13 +343,20 @@ def main() -> None:
     ap.add_argument("--fid-count", type=int, default=1024)
     ap.add_argument("--manifest", type=Path, default=None)
     ap.add_argument("--manifest-seed", type=int, default=123)
-    ap.add_argument(
-        "--no-lpips",
-        action="store_true",
-        help="Skip perceptual loss (otherwise LPIPS starts halfway through planned steps).",
-    )
+    ap.add_argument("--no-lpips", action="store_true")
+    ap.add_argument("--lpips-start-frac", type=float, default=0.1)
     ap.add_argument("--max-train-images", type=int, default=None)
     ap.add_argument("--amp", action="store_true")
+    ap.add_argument("--early-stop-patience", type=int, default=20)
+    ap.add_argument("--early-stop-min-delta", type=float, default=0.0)
+    ap.add_argument("--color-loss-weight", type=float, default=0.0)
+    ap.add_argument("--color-loss-start-frac", type=float, default=0.6)
+    ap.add_argument("--color-loss-ramp-steps", type=float, default=5000.0)
+    ap.add_argument("--no-loss-plot", action="store_true")
+    ap.add_argument("--loss-plot-path", type=Path, default=None)
+    ap.add_argument("--no-psnr-plot", action="store_true")
+    ap.add_argument("--psnr-plot-path", type=Path, default=None)
+    ap.add_argument("--triplet-channel-swap-debug", action="store_true")
     args = ap.parse_args()
 
     set_seed(args.seed)
@@ -217,19 +375,28 @@ def main() -> None:
         id_list = sample_fixed_manifest(
             args.data_root,
             PART_VAL,
-            image_root=None,
+            image_root=args.image_root,
             max_count=min(args.fid_count, 50_000),
             seed=args.manifest_seed,
             out_json=manifest_path,
         )
 
     ds_tr = CelebSketchDataset(
-        args.data_root, PART_TRAIN, args.image_size, max_images=args.max_train_images
+        args.data_root,
+        PART_TRAIN,
+        args.image_size,
+        max_images=args.max_train_images,
+        image_root=args.image_root,
     )
-    ds_va = CelebSketchDataset(args.data_root, PART_VAL, args.image_size)
-    ds_fid = CelebSketchDataset(args.data_root, PART_VAL, args.image_size, only_filenames=id_list)
+    ds_va = CelebSketchDataset(args.data_root, PART_VAL, args.image_size, image_root=args.image_root)
+    ds_fid = CelebSketchDataset(
+        args.data_root, PART_VAL, args.image_size, image_root=args.image_root, only_filenames=id_list
+    )
     if len(ds_tr) == 0:
-        raise SystemExit("No training images under data/ — check CSV and img_align_celeba.")
+        raise SystemExit(
+            "No training images — check list_eval_partition.csv, --image-root, and that JPGs "
+            "exist under that folder (often nested like img_align_celeba/img_align_celeba/)."
+        )
 
     pin = device.type == "cuda"
     dl_tr = DataLoader(
@@ -250,36 +417,17 @@ def main() -> None:
 
     steps_per_epoch = len(dl_tr)
     if steps_per_epoch == 0:
-        raise SystemExit(
-            "Train DataLoader has no batches (dataset smaller than --batch-size with drop_last?). "
-            "Lower --batch-size."
-        )
-    epoch_budget = args.epochs * steps_per_epoch
-    if args.max_steps and args.max_steps > 0:
-        planned_steps = min(epoch_budget, args.max_steps)
-    else:
-        planned_steps = epoch_budget
+        raise SystemExit("Train DataLoader has no batches. Lower --batch-size.")
 
-    lpips_mid = planned_steps // 2
+    epoch_budget = args.epochs * steps_per_epoch
+    planned_steps = min(epoch_budget, args.max_steps) if args.max_steps and args.max_steps > 0 else epoch_budget
+    lpips_start_frac = max(0.0, min(1.0, float(args.lpips_start_frac)))
+    lpips_mid = int(round(planned_steps * lpips_start_frac))
     use_lpips = (not args.no_lpips) and planned_steps > 0
     args.planned_train_steps = planned_steps
     args.lpips_start_step = lpips_mid if use_lpips else -1
-
-    print(
-        f"[train] train samples={len(ds_tr)} batch={args.batch_size} → "
-        f"batches/epoch={steps_per_epoch} epochs={args.epochs} "
-        f"max_steps={args.max_steps if args.max_steps > 0 else 'no-cap'} "
-        f"→ planned_steps≈{planned_steps}",
-        flush=True,
-    )
-    if use_lpips:
-        print(
-            f"[train] LPIPS from step≈{lpips_mid} "
-            f"(ramp={LPIPS_RAMP_STEPS}, λ_max={LPIPS_LAMBDA_MAX})",
-            flush=True,
-        )
-    elif args.no_lpips:
-        print("[train] LPIPS off (--no-lpips)", flush=True)
+    color_start_frac = max(0.0, min(1.0, float(args.color_loss_start_frac)))
+    color_start_step = int(round(planned_steps * color_start_frac))
 
     model = SketchEpsilonUNet(base=args.base_channels).to(device)
     ema = SketchEpsilonUNet(base=args.base_channels).to(device)
@@ -287,11 +435,15 @@ def main() -> None:
     for q in ema.parameters():
         q.requires_grad_(False)
 
-    ddpm = GaussianDDPM(args.timesteps, beta_start=args.beta_start, beta_end=args.beta_end).to(device)
+    ddpm = GaussianDDPM(
+        args.timesteps,
+        beta_start=args.beta_start,
+        beta_end=args.beta_end,
+        beta_schedule=args.beta_schedule,
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr)
     use_amp = bool(args.amp and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
     lip = lpips_optional(device, use_lpips)
 
     from torch.utils.tensorboard import SummaryWriter
@@ -301,9 +453,19 @@ def main() -> None:
 
     global_step = 0
     best_val = float("inf")
-    fields_m = ["step", "epoch", "train_loss", "val_loss", "lr"]
+    bad_epochs = 0
+    fields_m = [
+        "step",
+        "epoch",
+        "train_loss",
+        "train_psnr",
+        "val_loss",
+        "val_psnr",
+        "epoch_seconds",
+        "lr",
+    ]
 
-    def train_one_batch(step_ix: int, batch: dict[str, torch.Tensor]) -> float:
+    def train_one_batch(step_ix: int, batch: dict[str, torch.Tensor]) -> tuple[float, float, float]:
         ph = batch["photo"].to(device, non_blocking=True)
         sk = batch["sketch"].to(device, non_blocking=True)
         bsz = ph.shape[0]
@@ -325,11 +487,23 @@ def main() -> None:
             else:
                 loss_eps = err.mean()
             pred_x0 = ddpm.predict_x0_from_eps(x_t, t, eps_hat)
-        lam = lambda_phase2(step_ix, lpips_mid, float(LPIPS_RAMP_STEPS), LPIPS_LAMBDA_MAX)
-        if lip is not None and lam > 0:
-            loss_fin = loss_eps + lam * lip(pred_x0.float(), ph.float()).mean()
-        else:
-            loss_fin = loss_eps
+
+        lam_lpips = lambda_phase2(step_ix, lpips_mid, float(LPIPS_RAMP_STEPS), LPIPS_LAMBDA_MAX)
+        loss_fin = loss_eps
+        if lip is not None and lam_lpips > 0:
+            loss_fin = loss_fin + lam_lpips * lip(pred_x0.float(), ph.float()).mean()
+
+        color_aux = torch.tensor(0.0, device=device)
+        if args.color_loss_weight > 0:
+            lam_color = lambda_phase2(
+                step_ix,
+                color_start_step,
+                float(args.color_loss_ramp_steps),
+                float(args.color_loss_weight),
+            )
+            if lam_color > 0:
+                color_aux = color_ab_l1(pred_x0, ph)
+                loss_fin = loss_fin + lam_color * color_aux
 
         if use_amp:
             scaler.scale(loss_fin).backward()
@@ -342,7 +516,8 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
         ema_sync(ema, model, args.ema_decay)
-        return float(loss_fin.item())
+        psnr_v = psnr_pred_x0_db(pred_x0.detach(), ph)
+        return float(loss_fin.item()), psnr_v, float(color_aux.item())
 
     def maybe_fid() -> None:
         if args.fid_every <= 0 or global_step % args.fid_every != 0:
@@ -373,17 +548,23 @@ def main() -> None:
 
     for epoch in range(args.epochs):
         model.train()
+        epoch_start = time.perf_counter()
+        last_loss_f = float("nan")
+        last_psnr_v = float("nan")
         bar = tqdm(dl_tr, desc=f"epoch {epoch}")
         for batch in bar:
             if args.max_steps and global_step >= args.max_steps:
                 break
-            loss_f = train_one_batch(global_step, batch)
+            loss_f, psnr_v, color_v = train_one_batch(global_step, batch)
+            last_loss_f, last_psnr_v = loss_f, psnr_v
             global_step += 1
             if args.fid_every > 0 and global_step % args.fid_every == 0:
                 maybe_fid()
             lr = opt.param_groups[0]["lr"]
-            bar.set_postfix(loss=f"{loss_f:.4f}", step=global_step)
+            bar.set_postfix(loss=f"{loss_f:.4f}", psnr=f"{psnr_v:.2f}", step=global_step)
             tb.add_scalar("train/loss", loss_f, global_step)
+            tb.add_scalar("train/psnr", psnr_v, global_step)
+            tb.add_scalar("train/color_ab_l1", color_v, global_step)
             tb.add_scalar("train/lr", lr, global_step)
             if global_step % 50 == 0:
                 csv_row(
@@ -392,7 +573,10 @@ def main() -> None:
                         "step": str(global_step),
                         "epoch": str(epoch),
                         "train_loss": f"{loss_f:.6f}",
+                        "train_psnr": f"{psnr_v:.4f}",
                         "val_loss": "",
+                        "val_psnr": "",
+                        "epoch_seconds": "",
                         "lr": f"{lr:.2e}",
                     },
                     fields_m,
@@ -407,32 +591,48 @@ def main() -> None:
                     device,
                     gs=args.guidance_scale,
                     steps=args.sample_steps,
+                    channel_swap_debug=args.triplet_channel_swap_debug,
                 )
 
-        vloss = validation_pass(model, ddpm, dl_va, device, min_snr)
+        vloss, vpsnr = validation_pass(ema, ddpm, dl_va, device, min_snr)
         tb.add_scalar("val/loss", vloss, global_step)
+        tb.add_scalar("val/psnr", vpsnr, global_step)
+        epoch_seconds = time.perf_counter() - epoch_start
         csv_row(
             metrics_path,
             {
                 "step": str(global_step),
                 "epoch": str(epoch),
                 "train_loss": "",
+                "train_psnr": "",
                 "val_loss": f"{vloss:.6f}",
+                "val_psnr": f"{vpsnr:.4f}",
+                "epoch_seconds": f"{epoch_seconds:.1f}",
                 "lr": f"{opt.param_groups[0]['lr']:.2e}",
             },
             fields_m,
         )
-        if vloss < best_val:
+        improved = vloss < (best_val - args.early_stop_min_delta)
+        if improved:
             best_val = vloss
+            bad_epochs = 0
             torch.save(
                 {"model": model.state_dict(), "ema": ema.state_dict(), "step": global_step, "args": vars(args)},
                 save_dir / "ckpt_best.pt",
             )
+        else:
+            bad_epochs += 1
         torch.save(
             {"model": model.state_dict(), "ema": ema.state_dict(), "step": global_step, "args": vars(args)},
             save_dir / "ckpt_last.pt",
         )
         if args.max_steps and global_step >= args.max_steps:
+            break
+        if args.early_stop_patience > 0 and bad_epochs >= args.early_stop_patience:
+            print(
+                f"[train] early stop: no EMA val_loss improvement for {bad_epochs} epoch(s).",
+                flush=True,
+            )
             break
 
     vb = next(iter(dl_va))
@@ -444,8 +644,15 @@ def main() -> None:
         device,
         gs=args.guidance_scale,
         steps=args.sample_steps,
+        channel_swap_debug=args.triplet_channel_swap_debug,
     )
     tb.close()
+    if not args.no_loss_plot:
+        png = args.loss_plot_path if args.loss_plot_path is not None else (save_dir / "train_loss.png")
+        save_loss_plot_png(metrics_path, png)
+    if not args.no_psnr_plot:
+        png = args.psnr_plot_path if args.psnr_plot_path is not None else (save_dir / "train_psnr.png")
+        save_psnr_plot_png(metrics_path, png)
     print("done.", global_step, "steps. best_val", best_val)
 
 

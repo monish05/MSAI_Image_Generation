@@ -16,5 +16,9 @@ torchvision>=0.16
 Pillow>=10.0
 tqdm>=4.66
 tensorboard>=2.14
+matplotlib>=3.8
 torchmetrics>=1.4
+torch-fidelity>=0.3.0
 lpips>=0.1.4
+
+# Optional: better white-background dataset prep (see requirements-whitebg-gpu.txt )
