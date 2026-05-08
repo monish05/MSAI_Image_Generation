@@ -47,7 +47,7 @@ Learning curves:
 
 Training progression video:
 
-<video src="assets/train.mp4" controls width="640"></video>
+[<video src="assets/train.mp4" controls width="640"></video>](https://github.com/user-attachments/assets/53200c51-05a1-4cbd-aa7f-4f01e3f13e44)
 
 ---
 
