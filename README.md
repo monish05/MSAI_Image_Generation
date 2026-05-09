@@ -3,7 +3,8 @@
 Sketch-conditioned diffusion model that generates aligned face images from a sketch. Uses pixel-space DDPM (UNet + DDIM) with EMA, CFG dropout, LPIPS, and an optional Lab color loss. Sketches are generated deterministically from each photo via the OpenCV "dodge" pipeline, so the conditioning signal is perfectly aligned to the target.
 
 - Dataset: [CelebA on Kaggle](https://www.kaggle.com/datasets/jessicali9530/celeba-dataset)
-- Live demo (Gradio): [Hugging Face Space - monish563/sketch-ddpm-demo](https://huggingface.co/spaces/monish563/sketch-ddpm-demo)
+- Live demo: [Hugging Face Space — monish563/sketch-ddpm-demo](https://huggingface.co/spaces/monish563/sketch-ddpm-demo)
+- Quick manual tests in that demo: sample sketch/photo pairs live in [`demo_test_images/`](demo_test_images/) — upload a `*_sketch.jpg` as the sketch input (the `*_photo.jpg` files are the aligned references only).
 - Full engineering history: [`docs/DEVLOG.md`](docs/DEVLOG.md)
 
 ---

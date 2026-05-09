@@ -13,14 +13,14 @@ from torch.utils.data import DataLoader
 ROOT = Path(__file__).resolve().parent.parent
 
 
-def _load_ckpt(path: Path, device: torch.device) -> dict:
+def _load_ckpt(path, device):
     try:
         return torch.load(path, map_location=device, weights_only=False)
     except TypeError:
         return torch.load(path, map_location=device)
 
 
-def main() -> None:
+def main():
     from .celeba import PART_TEST, CelebSketchDataset, sample_fixed_manifest
     from .ddpm import GaussianDDPM
     from .train import run_fid_manifest, save_triplets, set_seed, validation_pass
@@ -69,7 +69,7 @@ def main() -> None:
     ck = _load_ckpt(args.ckpt, device)
     saved: dict = ck.get("args") or {}
 
-    def pick(key: str, cli_val, default):
+    def pick(key, cli_val, default):
         if cli_val is not None:
             return cli_val
         v = saved.get(key)

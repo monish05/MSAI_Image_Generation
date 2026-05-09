@@ -1,4 +1,4 @@
-"""Sketch-conditioned U-Net for epsilon prediction (pixel diffusion)."""
+"""UNet predicts eps; 4ch in (noisy RGB + sketch), 3ch out."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-def timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
+def timestep_embedding(timesteps, dim):
     half = dim // 2
     freqs = torch.exp(
         -math.log(10_000) * torch.arange(0, half, dtype=torch.float32, device=timesteps.device) / half
@@ -22,7 +22,7 @@ def timestep_embedding(timesteps: torch.Tensor, dim: int) -> torch.Tensor:
 
 
 class ResBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, t_dim: int) -> None:
+    def __init__(self, in_ch, out_ch, t_dim):
         super().__init__()
         gn = lambda c: nn.GroupNorm(min(8, c), c)
         self.n1 = gn(in_ch)
@@ -33,7 +33,7 @@ class ResBlock(nn.Module):
         self.t_proj = nn.Linear(t_dim, out_ch)
         self.shortcut = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, t_emb):
         h = self.c1(self.act(self.n1(x)))
         h = h + self.t_proj(t_emb)[:, :, None, None]
         h = self.c2(self.act(self.n2(h)))
@@ -41,9 +41,7 @@ class ResBlock(nn.Module):
 
 
 class SketchEpsilonUNet(nn.Module):
-    """4 input channels (RGB noisy + sketch); 3-channel epsilon out."""
-
-    def __init__(self, base: int = 96) -> None:
+    def __init__(self, base=96):
         super().__init__()
         self._t_sin = base
         self.t_emb_dim = base * 4
@@ -87,9 +85,8 @@ class SketchEpsilonUNet(nn.Module):
         self.out_act = nn.SiLU()
         self.out_conv = nn.Conv2d(c1, 3, 3, padding=1)
 
-    def forward(self, x_t: torch.Tensor, sketch: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+    def forward(self, x_t, sketch, t):
         t_emb = self.t_mlp(timestep_embedding(t, self._t_sin))
-
         x = torch.cat([x_t, sketch], dim=1)
 
         h0 = self.in_conv(x)

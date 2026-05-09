@@ -52,7 +52,7 @@ Stage B optional follow-ups: configure `STAGE_B_FOLLOWUP` in the notebook after 
 
 ## Evaluation and selection rubric
 
-Use Tier A sweep for each run (`scripts/eval_stage2_runs.sh` or commands printed by the notebook), then rank by:
+Use `python -m src.eval_test` (vary `--guidance-scale` / `--sample-steps` as needed) for each run, or the sample commands printed by `notebooks/stage2_cases/analyze_stage2_cases.ipynb`, then rank by:
 
 1. Hair-color correctness
 2. Skin-tone realism

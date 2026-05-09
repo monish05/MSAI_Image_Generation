@@ -1,4 +1,4 @@
-"""CelebA aligned faces under data/: partition from list_eval_partition.csv."""
+"""CelebA img_align_celeba + list_eval_partition → photo/sketch pairs."""
 
 from __future__ import annotations
 
@@ -19,23 +19,19 @@ PART_TEST = 2
 
 
 def resolve_image_root(data_root: Path) -> Path:
-    dire = data_root / "img_align_celeba"
-    if not dire.is_dir():
-        raise FileNotFoundError(f"Missing {dire}")
-    if list(dire.glob("*.jpg")):
-        return dire
-    inner = dire / "img_align_celeba"
+    img_dir = data_root / "img_align_celeba"
+    if not img_dir.is_dir():
+        raise FileNotFoundError(f"Missing {img_dir}")
+    if list(img_dir.glob("*.jpg")):
+        return img_dir
+    inner = img_dir / "img_align_celeba"
     if inner.is_dir() and list(inner.glob("*.jpg")):
         return inner
-    raise FileNotFoundError(f"No .jpg under {dire}")
+    raise FileNotFoundError(f"No .jpg under {img_dir}")
 
 
 def normalize_image_root(data_root: Path, image_root: Path | None) -> Path:
-    """Directory that actually holds *.jpg, including nested CelebA zip layout.
-
-    Official CelebA often extracts to ``img_align_celeba/img_align_celeba/*.jpg``.
-    Passing only the outer folder as ``--image-root`` would otherwise yield 0 files.
-    """
+    # Nested zip layout img_align_celeba/img_align_celeba/*.jpg is common if you unzip wrong.
     root = Path(data_root).resolve()
     if image_root is None:
         return resolve_image_root(root)
@@ -48,13 +44,13 @@ def normalize_image_root(data_root: Path, image_root: Path | None) -> Path:
     return ir
 
 
-def list_image_ids_sorted(data_root: Path, partition: int, image_root: Path | None = None) -> list[str]:
+def list_image_ids_sorted(data_root, partition, image_root=None):
     root = Path(data_root).resolve()
     ir = normalize_image_root(root, image_root)
     part_csv = root / "list_eval_partition.csv"
     if not part_csv.is_file():
         raise FileNotFoundError(part_csv)
-    rows: list[str] = []
+    rows = []
     with part_csv.open(newline="") as f:
         for r in csv.DictReader(f):
             if int(r["partition"]) != partition:
@@ -67,19 +63,17 @@ def list_image_ids_sorted(data_root: Path, partition: int, image_root: Path | No
 
 
 class CelebSketchDataset(Dataset):
-    """Paired photo + synthetic sketch per aligned face."""
-
+    # One aligned face JPG → RGB photo tensor + dodge sketch tensor (both [-1,1]).
     def __init__(
         self,
-        data_root: Path,
-        partition: int,
-        image_size: int,
-        *,
-        blur_ksize: int = 21,
-        max_images: int | None = None,
-        image_root: Path | None = None,
-        only_filenames: list[str] | None = None,
-    ) -> None:
+        data_root,
+        partition,
+        image_size,
+        blur_ksize=21,
+        max_images=None,
+        image_root=None,
+        only_filenames=None,
+    ):
         super().__init__()
         self.data_root = Path(data_root).resolve()
         self.image_root = normalize_image_root(self.data_root, image_root)
@@ -89,24 +83,22 @@ class CelebSketchDataset(Dataset):
             rows = [f for f in rows if f in want]
             rows.sort()
         if max_images is not None:
-            rows = rows[: max_images]
+            rows = rows[:max_images]
         self._files = rows
         self.image_size = image_size
         self.blur_ksize = blur_ksize
 
-    def __len__(self) -> int:
+    def __len__(self):
         return len(self._files)
 
-    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+    def __getitem__(self, idx):
         path = self.image_root / self._files[idx]
         bgr = cv2.imread(str(path))
         if bgr is None:
             raise RuntimeError(f"Unreadable image {path}")
-
         sz = self.image_size
         bgr = cv2.resize(bgr, (sz, sz), interpolation=cv2.INTER_AREA)
         sk_uint8 = photo_bgr_uint8_to_sketch_gray(bgr, blur_ksize=self.blur_ksize)
-
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
         photo = torch.from_numpy(rgb).permute(2, 0, 1).contiguous()
         sketch = sketch_gray_uint8_to_tensor01(sk_uint8)
@@ -115,19 +107,11 @@ class CelebSketchDataset(Dataset):
         return {"photo": photo_m11, "sketch": sketch_m11}
 
 
-def sample_fixed_manifest(
-    data_root: Path,
-    partition: int,
-    *,
-    image_root: Path | None,
-    max_count: int,
-    seed: int,
-    out_json: Path | None = None,
-) -> list[str]:
+def sample_fixed_manifest(data_root, partition, image_root, max_count, seed, out_json=None):
     names = list_image_ids_sorted(data_root, partition, image_root)
     g = torch.Generator().manual_seed(seed)
     idx = torch.randperm(len(names), generator=g).tolist()
-    sel = sorted(names[i] for i in idx[: max_count])
+    sel = sorted(names[i] for i in idx[:max_count])
     if out_json is not None:
         out_json.parent.mkdir(parents=True, exist_ok=True)
         payload = {"image_ids": sel, "seed": seed, "partition": partition}

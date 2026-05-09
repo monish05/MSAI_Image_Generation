@@ -24,20 +24,20 @@ LPIPS_LAMBDA_MAX = 0.05
 LPIPS_RAMP_STEPS = 5000
 
 
-def set_seed(seed: int) -> None:
+def set_seed(seed):
     random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
 
-def ema_sync(dst: nn.Module, src: nn.Module, decay: float) -> None:
+def ema_sync(dst, src, decay):
     with torch.no_grad():
         for kd, ks in zip(dst.state_dict().values(), src.state_dict().values()):
             kd.mul_(decay).add_(ks, alpha=1.0 - decay)
 
 
-def sketch_cfg_dropout(sketch: torch.Tensor, p: float) -> torch.Tensor:
+def sketch_cfg_dropout(sketch, p):
     if p <= 0:
         return sketch
     b = sketch.shape[0]
@@ -47,7 +47,7 @@ def sketch_cfg_dropout(sketch: torch.Tensor, p: float) -> torch.Tensor:
     return sketch * m + blank * (1.0 - m)
 
 
-def csv_row(path: Path, cols: dict[str, str], fields: list[str]) -> None:
+def csv_row(path: Path, cols, fields):
     path.parent.mkdir(parents=True, exist_ok=True)
     new = not path.is_file()
     with path.open("a", newline="") as fh:
@@ -57,13 +57,11 @@ def csv_row(path: Path, cols: dict[str, str], fields: list[str]) -> None:
         w.writerow(cols)
 
 
-def _read_metric_series(
-    metrics_csv: Path, train_col: str, val_col: str
-) -> tuple[list[int], list[float], list[int], list[float]]:
-    st_t: list[int] = []
-    y_t: list[float] = []
-    st_v: list[int] = []
-    y_v: list[float] = []
+def _read_metric_series(metrics_csv: Path, train_col, val_col):
+    st_t = []
+    y_t = []
+    st_v = []
+    y_v = []
     if not metrics_csv.is_file():
         return st_t, y_t, st_v, y_v
     with metrics_csv.open(newline="") as fh:
@@ -89,15 +87,7 @@ def _read_metric_series(
     return st_t, y_t, st_v, y_v
 
 
-def _plot_metric_png(
-    metrics_csv: Path,
-    out_png: Path,
-    *,
-    train_col: str,
-    val_col: str,
-    y_label: str,
-    title: str,
-) -> None:
+def _plot_metric_png(metrics_csv, out_png, train_col, val_col, y_label, title):
     try:
         import matplotlib
 
@@ -128,7 +118,7 @@ def _plot_metric_png(
     plt.close(fig)
 
 
-def save_loss_plot_png(metrics_csv: Path, out_png: Path) -> None:
+def save_loss_plot_png(metrics_csv, out_png):
     _plot_metric_png(
         metrics_csv,
         out_png,
@@ -139,7 +129,7 @@ def save_loss_plot_png(metrics_csv: Path, out_png: Path) -> None:
     )
 
 
-def save_psnr_plot_png(metrics_csv: Path, out_png: Path) -> None:
+def save_psnr_plot_png(metrics_csv, out_png):
     _plot_metric_png(
         metrics_csv,
         out_png,
@@ -150,19 +140,19 @@ def save_psnr_plot_png(metrics_csv: Path, out_png: Path) -> None:
     )
 
 
-def m11_as_float01(x: torch.Tensor) -> torch.Tensor:
+def m11_as_float01(x):
     return (x.clamp(-1, 1) + 1.0) * 0.5
 
 
 @torch.no_grad()
-def psnr_pred_x0_db(pred_x0: torch.Tensor, photo: torch.Tensor) -> float:
+def psnr_pred_x0_db(pred_x0, photo):
     p = m11_as_float01(pred_x0).float()
     g = m11_as_float01(photo).float()
     mse = (p - g).pow(2).mean(dim=(1, 2, 3)).clamp(min=1e-12)
     return float((10.0 * torch.log10(1.0 / mse)).mean().item())
 
 
-def _rgb01_to_lab(rgb: torch.Tensor) -> torch.Tensor:
+def _rgb01_to_lab(rgb):
     eps = 1e-6
     rgb = rgb.clamp(0.0, 1.0)
     a = 0.055
@@ -182,7 +172,7 @@ def _rgb01_to_lab(rgb: torch.Tensor) -> torch.Tensor:
     d3 = d**3
     k = 1 / (3 * d * d)
 
-    def f(t: torch.Tensor) -> torch.Tensor:
+    def f(t):
         return torch.where(t > d3, t.clamp_min(eps).pow(1 / 3), k * t + 4 / 29)
 
     fx, fy, fz = f(x), f(y), f(z)
@@ -192,16 +182,14 @@ def _rgb01_to_lab(rgb: torch.Tensor) -> torch.Tensor:
     return torch.cat([l, aa, bb], dim=1)
 
 
-def color_ab_l1(pred_x0: torch.Tensor, photo: torch.Tensor) -> torch.Tensor:
+def color_ab_l1(pred_x0, photo):
     pred = _rgb01_to_lab(m11_as_float01(pred_x0).float())
     gt = _rgb01_to_lab(m11_as_float01(photo).float())
     return (pred[:, 1:] - gt[:, 1:]).abs().mean()
 
 
 @torch.no_grad()
-def validation_pass(
-    model: nn.Module, ddpm_module, dl: DataLoader, device: torch.device, min_snr: float | None
-) -> tuple[float, float]:
+def validation_pass(model, ddpm_module, dl, device, min_snr):
     was_training = model.training
     model.eval()
     tot_loss = 0.0
@@ -222,17 +210,7 @@ def validation_pass(
 
 
 @torch.no_grad()
-def save_triplets(
-    ema_m: nn.Module,
-    diffusion,
-    batch: dict[str, torch.Tensor],
-    path: Path,
-    device: torch.device,
-    *,
-    gs: float,
-    steps: int,
-    channel_swap_debug: bool = False,
-) -> None:
+def save_triplets(ema_m, diffusion, batch, path: Path, device, gs, steps, channel_swap_debug=False):
     sk = batch["sketch"].to(device)
     ph = batch["photo"].to(device)
     n = min(4, sk.shape[0])
@@ -251,7 +229,7 @@ def save_triplets(
         save_image(trip4, swap_path, nrow=4)
 
 
-def lpips_optional(device: torch.device, use: bool) -> nn.Module | None:
+def lpips_optional(device, use):
     if not use:
         return None
     try:
@@ -265,7 +243,7 @@ def lpips_optional(device: torch.device, use: bool) -> nn.Module | None:
     return m
 
 
-def lambda_phase2(step: int, phase_start: int, ramp_steps: float, lam_max: float) -> float:
+def lambda_phase2(step, phase_start, ramp_steps, lam_max):
     if phase_start < 0 or step < phase_start:
         return 0.0
     if ramp_steps <= 0:
@@ -275,16 +253,7 @@ def lambda_phase2(step: int, phase_start: int, ramp_steps: float, lam_max: float
 
 
 @torch.no_grad()
-def run_fid_manifest(
-    ema_m: nn.Module,
-    diffusion,
-    ds_subset,
-    device: torch.device,
-    *,
-    guidance_scale: float,
-    steps: int,
-    batch_sz: int,
-) -> float | None:
+def run_fid_manifest(ema_m, diffusion, ds_subset, device, guidance_scale, steps, batch_sz):
     try:
         from torchmetrics.image.fid import FrechetInceptionDistance
     except ImportError:
@@ -312,7 +281,7 @@ def run_fid_manifest(
     return float(fid_m.compute().item())
 
 
-def main() -> None:
+def main():
     from .celeba import PART_TRAIN, PART_VAL, CelebSketchDataset, sample_fixed_manifest
     from .ddpm import GaussianDDPM
     from .unet import SketchEpsilonUNet
@@ -508,7 +477,7 @@ def main() -> None:
         "lr",
     ]
 
-    def train_one_batch(step_ix: int, batch: dict[str, torch.Tensor]) -> tuple[float, float, float]:
+    def train_one_batch(step_ix, batch):
         ph = batch["photo"].to(device, non_blocking=True)
         sk = batch["sketch"].to(device, non_blocking=True)
         bsz = ph.shape[0]
@@ -562,7 +531,7 @@ def main() -> None:
         psnr_v = psnr_pred_x0_db(pred_x0.detach(), ph)
         return float(loss_fin.item()), psnr_v, float(color_aux.item())
 
-    def maybe_fid() -> None:
+    def maybe_fid():
         if args.fid_every <= 0 or global_step % args.fid_every != 0:
             return
         fid_v = run_fid_manifest(

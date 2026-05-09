@@ -1,14 +1,14 @@
-"""Gaussian DDPM — epsilon loss, DDIM, optional CFG."""
+"""Pixel DDPM: eps loss, DDIM sampler, classifier-free guidance."""
 
 from __future__ import annotations
 
-import torch
-import torch.nn as nn
 import math
 
+import torch
+import torch.nn as nn
 
-def _cosine_alphas_cumprod(timesteps: int, s: float = 0.008) -> torch.Tensor:
-    """Nichol & Dhariwal cosine schedule."""
+
+def _cosine_alphas_cumprod(timesteps, s=0.008):
     x = torch.linspace(0, timesteps, timesteps + 1, dtype=torch.float64)
     f = torch.cos(((x / timesteps) + s) / (1 + s) * math.pi / 2) ** 2
     f = f / f[0]
@@ -19,13 +19,7 @@ def _cosine_alphas_cumprod(timesteps: int, s: float = 0.008) -> torch.Tensor:
 
 
 class GaussianDDPM(nn.Module):
-    def __init__(
-        self,
-        timesteps: int,
-        beta_start: float = 1e-4,
-        beta_end: float = 2e-2,
-        beta_schedule: str = "linear",
-    ) -> None:
+    def __init__(self, timesteps, beta_start=1e-4, beta_end=2e-2, beta_schedule="linear"):
         super().__init__()
         if beta_schedule == "linear":
             betas = torch.linspace(beta_start, beta_end, timesteps)
@@ -34,33 +28,23 @@ class GaussianDDPM(nn.Module):
         elif beta_schedule == "cosine":
             alphas_cumprod = _cosine_alphas_cumprod(timesteps)
         else:
-            raise ValueError(
-                f"Unknown beta_schedule={beta_schedule!r}; expected 'linear' or 'cosine'."
-            )
+            raise ValueError(f"Unknown beta_schedule={beta_schedule!r}; want linear or cosine.")
         self.register_buffer("alphas_cumprod", alphas_cumprod)
         self.timesteps = int(timesteps)
         self.beta_schedule = beta_schedule
 
-    def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor | None = None):
+    def q_sample(self, x0, t, noise=None):
         if noise is None:
             noise = torch.randn_like(x0)
         a = self.alphas_cumprod[t][:, None, None, None]
         return torch.sqrt(a) * x0 + torch.sqrt(torch.clamp(1.0 - a, min=1e-8)) * noise
 
-    def predict_x0_from_eps(self, x_t: torch.Tensor, t: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
+    def predict_x0_from_eps(self, x_t, t, eps):
         a = self.alphas_cumprod[t][:, None, None, None]
         s2 = torch.sqrt(torch.clamp(1.0 - a, min=1e-8))
         return (x_t - s2 * eps) / torch.sqrt(a.clamp(min=1e-8))
 
-    def training_losses(
-        self,
-        model: nn.Module,
-        x0: torch.Tensor,
-        sketch: torch.Tensor,
-        *,
-        noise: torch.Tensor | None = None,
-        min_snr_gamma: float | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    def training_losses(self, model, x0, sketch, noise=None, min_snr_gamma=None):
         b = x0.shape[0]
         device = x0.device
         if noise is None:
@@ -81,15 +65,14 @@ class GaussianDDPM(nn.Module):
     @torch.no_grad()
     def ddim_sample_loop(
         self,
-        model: nn.Module,
-        sketch: torch.Tensor,
-        *,
-        guidance_scale: float,
-        eta: float = 0.0,
-        steps: int = 50,
-        generator: torch.Generator | None = None,
-        null_sketch_val: float = -1.0,
-    ) -> torch.Tensor:
+        model,
+        sketch,
+        guidance_scale,
+        eta=0.0,
+        steps=50,
+        generator=None,
+        null_sketch_val=-1.0,
+    ):
         b, _, h, w = sketch.shape
         device = sketch.device
         alp = self.alphas_cumprod
