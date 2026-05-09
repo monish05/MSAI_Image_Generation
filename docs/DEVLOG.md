@@ -195,7 +195,11 @@ Source: [`../checkpoints/stage1_baseline/`](../checkpoints/stage1_baseline/)
 
 - Best numeric run: `H03_batch_16` on `val_psnr` (28.59) and `test_psnr_db` (29.13). Caveats: `H11_min_snr_5`'s `val_loss` (0.005337) and `H10_linear_schedule`'s `val_loss` (0.009757) are not directly comparable to other runs because Min-SNR and the linear schedule change the loss weighting; H10's PSNR/FID confirm it is actually worse.
 - Best `test_fid`: `H07_sample_steps_fast` (72.75).
-- Best visual run (rubric): `TODO - awaiting side-by-side rubric scoring of triplet PNGs in checkpoints/hp_H*/eval_test/`.
+- Best visual run (rubric): side-by-side eval triplets for all 12 runs (3×4 grid: sketch | generated | ground truth per [`hyperparam_run_matrix.md`](hyperparam_run_matrix.md) rubric axes).
+
+  ![Stage-2 rubric composite](../assets/stage2_rubric_compare.png)
+
+  Visually and by `test_fid`, **`H07_sample_steps_fast`** is the strongest; **`H10_linear_schedule`** is clearly the weakest (color breakdown, highest FID). **`H03_batch_16`** remains the best scalar match to GT on **`test_psnr_db`** among runs that looked acceptable; many configs still show skin/hair color drift vs. GT.
 - Stage-B follow-up plan: re-run eval (`python -m src.eval_test`, varying guidance / sample steps) for `H03_batch_16`, `H07_sample_steps_fast`, and `H00_baseline`; rubric scoring on top-3 visual outputs; if `H03_batch_16` confirms, sweep `batch-size` and longer training.
 - Best Tier-A combo (`sample_steps`, `guidance_scale`): `TODO - pending Tier-A grid runs`.
 
