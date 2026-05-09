@@ -62,8 +62,7 @@ Training progression video:
 
 - **Distributed training** - PyTorch `torchrun --nproc_per_node=N -m src.train_ddpm ...` was exercised during the human-sketch (Sketchy) phase to scale throughput. See [`docs/DEVLOG.md`](docs/DEVLOG.md).
 - **Tracking** - per-run `metrics.csv` and TensorBoard scalars (`train/loss`, `train/psnr`, `train/lr`, `val/loss`, `val/psnr`).
-- **HPO** - 12-bundle Stage-2 hyperparameter search with shared rubric in [`docs/hyperparam_run_matrix.md`](docs/hyperparam_run_matrix.md), driven by [`slurm/quest_stage2_hyperparam_search.sh`](slurm/quest_stage2_hyperparam_search.sh) and per-case notebooks in [`notebooks/stage2_cases/`](notebooks/stage2_cases/).
-- **MLOps** - reproducible Quest SLURM scripts ([`slurm/quest_stage1_baseline.sh`](slurm/quest_stage1_baseline.sh), [`slurm/quest_stage2_hyperparam_search.sh`](slurm/quest_stage2_hyperparam_search.sh)) that train + evaluate in a single job.
+- **HPO** - 12-bundle Stage-2 hyperparameter search with shared rubric in [`docs/hyperparam_run_matrix.md`](docs/hyperparam_run_matrix.md), driven by per-case notebooks in [`notebooks/stage2_cases/`](notebooks/stage2_cases/).
 
 ---
 
